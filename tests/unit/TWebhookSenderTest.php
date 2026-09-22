@@ -1,0 +1,580 @@
+<?php
+
+use Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature;
+use Belisoful\Prado\Web\Webhooks\TWebhookDelivery;
+use Belisoful\Prado\Web\Webhooks\TWebhookModule;
+use Belisoful\Prado\Web\Webhooks\TWebhookRequest;
+use Belisoful\Prado\Web\Webhooks\TWebhookSender;
+use Belisoful\Prado\Web\Webhooks\TWebhookTarget;
+use Prado\Exceptions\TInvalidDataValueException;
+use Prado\IO\HttpClient\THttpClient;
+use Prado\IO\HttpClient\THttpClientException;
+use Prado\IO\HttpClient\THttpClientResponse;
+
+/**
+ * A transport that answers from a script and records what it was asked, so the retry policy
+ * can be run without a network and without spending the wall clock on backoff.
+ */
+class TestHttpClient extends THttpClient
+{
+	/** @var array<int, array{method: string, url: string, headers: array, body: ?string}> */
+	public array $requests = [];
+
+	/** @var array<int, THttpClientResponse|Throwable> answers, in order; the last one repeats */
+	public array $answers = [];
+
+	public function download(string $method, string $url, array $headers = [], ?string $body = null): THttpClientResponse
+	{
+		$this->requests[] = ['method' => $method, 'url' => $url, 'headers' => $headers, 'body' => $body];
+
+		$answer = count($this->answers) > 1 ? array_shift($this->answers) : ($this->answers[0] ?? null);
+		if ($answer instanceof Throwable) {
+			throw $answer;
+		}
+
+		return $answer ?? new THttpClientResponse(200);
+	}
+}
+
+/**
+ * A sender that records what it would have waited instead of waiting.
+ */
+class TestWebhookSender extends TWebhookSender
+{
+	/** @var int[] */
+	public array $pauses = [];
+
+	protected function pause(int $milliseconds): void
+	{
+		$this->pauses[] = $milliseconds;
+	}
+}
+
+class TWebhookSenderTest extends PHPUnit\Framework\TestCase
+{
+	private const URL = 'https://example.com/hooks/prado';
+
+	private TestWebhookSender $_sender;
+	private TestHttpClient $_client;
+
+	protected function setUp(): void
+	{
+		$this->_client = new TestHttpClient();
+		$this->_sender = new TestWebhookSender();
+		$this->_sender->setHttpClient($this->_client);
+	}
+
+	private function answer(...$answers): void
+	{
+		$this->_client->answers = $answers;
+	}
+
+	/** Rebuilds the request the sender made, so a verifier can be pointed at it. */
+	private function sent(int $index = 0): TWebhookRequest
+	{
+		$request = $this->_client->requests[$index];
+
+		return new TWebhookRequest($request['method'], (string) $request['body'], $request['headers'], $request['url']);
+	}
+
+	public function testASuccessfulDeliveryIsSentOnce()
+	{
+		$this->answer(new THttpClientResponse(200));
+
+		$deliveries = $this->_sender->send(self::URL, ['id' => 1], 'invoice.paid');
+
+		$this->assertCount(1, $deliveries);
+		$this->assertTrue($deliveries[0]->getSuccessful());
+		$this->assertSame(1, $deliveries[0]->getAttempts());
+		$this->assertCount(1, $this->_client->requests);
+		$this->assertSame([], $this->_sender->pauses);
+	}
+
+	public function testTheRequestCarriesThePayloadAndItsHeaders()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->send(self::URL, ['id' => 1], 'invoice.paid');
+
+		$request = $this->_client->requests[0];
+		$this->assertSame('POST', $request['method']);
+		$this->assertSame(self::URL, $request['url']);
+		$this->assertSame('{"id":1}', $request['body']);
+		$this->assertSame('application/json', $request['headers']['Content-Type']);
+		$this->assertSame('invoice.paid', $request['headers'][TWebhookTarget::DEFAULT_EVENT_HEADER]);
+		$this->assertSame(TWebhookSender::getDefaultUserAgent(), $request['headers']['User-Agent']);
+	}
+
+	public function testEveryTargetGetsTheSameDeliveryIdOnItsOwnRetries()
+	{
+		$this->answer(new THttpClientResponse(500), new THttpClientResponse(200));
+		$this->_sender->setMaxAttempts(2);
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$header = TWebhookTarget::DEFAULT_DELIVERY_HEADER;
+		$this->assertSame($delivery->getID(), $this->_client->requests[0]['headers'][$header]);
+		$this->assertSame($delivery->getID(), $this->_client->requests[1]['headers'][$header]);
+	}
+
+	public function testDeliveryIdsDifferBetweenDeliveries()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$deliveries = $this->_sender->send([self::URL, 'https://other.example/hook'], ['id' => 1]);
+
+		$this->assertNotSame($deliveries[0]->getID(), $deliveries[1]->getID());
+	}
+
+	public function testAServerErrorIsRetriedUntilItSucceeds()
+	{
+		$this->answer(new THttpClientResponse(503), new THttpClientResponse(200));
+		$this->_sender->setMaxAttempts(3);
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertTrue($delivery->getSuccessful());
+		$this->assertSame(2, $delivery->getAttempts());
+		$this->assertCount(2, $this->_client->requests);
+	}
+
+	public function testAClientErrorIsNotRetried()
+	{
+		// The receiver understood the request and refused it; sending it again cannot help.
+		$this->answer(new THttpClientResponse(400));
+		$this->_sender->setMaxAttempts(5);
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertFalse($delivery->getSuccessful());
+		$this->assertSame(1, $delivery->getAttempts());
+		$this->assertSame('HTTP 400', $delivery->getStatusText());
+	}
+
+	public function testATooManyRequestsIsRetriedEvenThoughItIsAClientError()
+	{
+		$this->answer(new THttpClientResponse(429), new THttpClientResponse(200));
+		$this->_sender->setMaxAttempts(2);
+
+		$this->assertTrue($this->_sender->send(self::URL, ['id' => 1])[0]->getSuccessful());
+	}
+
+	public function testRetriesRunOutAndTheDeliveryFails()
+	{
+		$this->answer(new THttpClientResponse(500));
+		$this->_sender->setMaxAttempts(3);
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertFalse($delivery->getSuccessful());
+		$this->assertSame(3, $delivery->getAttempts());
+		$this->assertCount(3, $this->_client->requests);
+	}
+
+	public function testTheBackoffDoublesAndIsNotWaitedAfterTheLastAttempt()
+	{
+		$this->answer(new THttpClientResponse(500));
+		$this->_sender->setMaxAttempts(4);
+		$this->_sender->setRetryDelay(100);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([100, 200, 400], $this->_sender->pauses);
+	}
+
+	public function testARetryAfterOverridesTheBackoff()
+	{
+		$this->answer(
+			new THttpClientResponse(429, ['Retry-After' => '2'], ''),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(2);
+		$this->_sender->setRetryDelay(100);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([2000], $this->_sender->pauses);
+	}
+
+	public function testAnAbsurdRetryAfterIsCapped()
+	{
+		$this->answer(new THttpClientResponse(503, ['Retry-After' => '86400'], ''), new THttpClientResponse(200));
+		$this->_sender->setMaxAttempts(2);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([TWebhookSender::MAX_RETRY_AFTER], $this->_sender->pauses);
+	}
+
+	public function testAnHttpDateRetryAfterFallsBackToTheBackoff()
+	{
+		$this->answer(
+			new THttpClientResponse(503, ['Retry-After' => 'Wed, 21 Oct 2026 07:28:00 GMT'], ''),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(2);
+		$this->_sender->setRetryDelay(100);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([100], $this->_sender->pauses);
+	}
+
+	public function testATransportFailureIsRetriedAndThenReported()
+	{
+		$this->answer(new THttpClientException('Connection refused'));
+		$this->_sender->setMaxAttempts(2);
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertFalse($delivery->getSuccessful());
+		$this->assertSame(2, $delivery->getAttempts());
+		$this->assertSame('Connection refused', $delivery->getStatusText());
+	}
+
+	public function testATransportFailureFollowedByASuccess()
+	{
+		$this->answer(new THttpClientException('Connection refused'), new THttpClientResponse(200));
+		$this->_sender->setMaxAttempts(2);
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertTrue($delivery->getSuccessful());
+		$this->assertNull($delivery->getError());
+	}
+
+	public function testTheRetryStatusListIsConfigurable()
+	{
+		$this->answer(new THttpClientResponse(418));
+		$this->_sender->setRetryStatusCodes('418, 500');
+		$this->_sender->setMaxAttempts(2);
+
+		$this->assertSame([418, 500], $this->_sender->getRetryStatusCodes());
+		$this->assertSame(2, $this->_sender->send(self::URL, ['id' => 1])[0]->getAttempts());
+	}
+
+	public function testDeliveriesAreSigned()
+	{
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('per-subscriber');
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send([['url' => self::URL, 'secret' => 'per-subscriber']], ['id' => 1]);
+
+		$this->assertArrayHasKey(THmacWebhookSignature::DEFAULT_HEADER, $this->_client->requests[0]['headers']);
+		$this->assertTrue($signature->verify($this->sent()));
+	}
+
+	public function testTheSendersSignatureCoversTargetsWithoutOneOfTheirOwn()
+	{
+		$fallback = new THmacWebhookSignature();
+		$fallback->setSecret('shared');
+		$this->_sender->setSignature($fallback);
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertTrue($fallback->verify($this->sent()));
+	}
+
+	public function testATargetsOwnSignatureWinsOverTheSenders()
+	{
+		$fallback = new THmacWebhookSignature();
+		$fallback->setSecret('shared');
+		$this->_sender->setSignature($fallback);
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send([['url' => self::URL, 'secret' => 'per-subscriber']], ['id' => 1]);
+
+		$this->assertFalse($fallback->verify($this->sent()));
+
+		$own = new THmacWebhookSignature();
+		$own->setSecret('per-subscriber');
+		$this->assertTrue($own->verify($this->sent()));
+	}
+
+	public function testEachRetryIsSignedAfresh()
+	{
+		// A timestamped signature made before a backoff would be stale by the time the retry
+		// arrives, so the signature is computed per attempt rather than once.
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setTimestampHeader('X-Webhook-Timestamp');
+		$signature->setPayloadFormat('{timestamp}.{body}');
+
+		$target = TWebhookTarget::ensure(self::URL);
+		$target->setSignature($signature);
+		$this->answer(new THttpClientResponse(500), new THttpClientResponse(200));
+		$this->_sender->setMaxAttempts(2);
+
+		$this->_sender->send($target, ['id' => 1]);
+
+		foreach (array_keys($this->_client->requests) as $index) {
+			$this->assertTrue($signature->verify($this->sent($index)));
+		}
+	}
+
+	public function testEventsAreRaisedForADeliveryThatSucceeds()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$seen = [];
+		foreach (['onSending', 'onDelivered', 'onFailed'] as $event) {
+			$this->_sender->attachEventHandler($event, function ($sender, $delivery) use (&$seen, $event) {
+				$seen[] = $event;
+			});
+		}
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame(['onSending', 'onDelivered'], $seen);
+	}
+
+	public function testEventsAreRaisedForADeliveryThatFails()
+	{
+		$this->answer(new THttpClientResponse(500));
+		$this->_sender->setMaxAttempts(1);
+		$seen = [];
+		foreach (['onSending', 'onDelivered', 'onFailed'] as $event) {
+			$this->_sender->attachEventHandler($event, function ($sender, $delivery) use (&$seen, $event) {
+				$seen[] = $event;
+			});
+		}
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame(['onSending', 'onFailed'], $seen);
+	}
+
+	public function testAHandlerMayAddHeadersBeforeSending()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->onSending[] = function ($sender, TWebhookDelivery $delivery) {
+			$delivery->setHeaders($delivery->getHeaders() + ['X-Tenant' => '7']);
+		};
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame('7', $this->_client->requests[0]['headers']['X-Tenant']);
+	}
+
+	public function testAHandlerMayRewriteTheBodyAndTheSignatureFollowsIt()
+	{
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->setSignature($signature);
+		$this->_sender->onSending[] = function ($sender, TWebhookDelivery $delivery) {
+			$delivery->setBody('{"rewritten":true}');
+		};
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame('{"rewritten":true}', $this->_client->requests[0]['body']);
+		$this->assertTrue($signature->verify($this->sent()));
+	}
+
+	public function testACancelledDeliveryIsReturnedWithNoAttempts()
+	{
+		$this->_sender->onSending[] = function ($sender, TWebhookDelivery $delivery) {
+			$delivery->setCancel(true);
+		};
+
+		$deliveries = $this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertCount(1, $deliveries);
+		$this->assertSame(0, $deliveries[0]->getAttempts());
+		$this->assertSame([], $this->_client->requests);
+	}
+
+	public function testADisabledTargetProducesNoDelivery()
+	{
+		$deliveries = $this->_sender->send([['url' => self::URL, 'enabled' => false]], ['id' => 1]);
+
+		$this->assertSame([], $deliveries);
+		$this->assertSame([], $this->_client->requests);
+	}
+
+	public function testATargetThatDidNotSubscribeToTheEventIsSkipped()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$deliveries = $this->_sender->send([
+			['url' => self::URL, 'events' => ['invoice.paid']],
+			['url' => 'https://other.example/hook', 'events' => ['invoice.failed']],
+			'https://everything.example/hook',
+		], ['id' => 1], 'invoice.paid');
+
+		$this->assertCount(2, $deliveries);
+		$this->assertSame(self::URL, $deliveries[0]->getTarget()->getUrl());
+		$this->assertSame('https://everything.example/hook', $deliveries[1]->getTarget()->getUrl());
+	}
+
+	public function testOneTargetNeedNotBeWrappedInAnArray()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$target = TWebhookTarget::ensure(self::URL);
+
+		$this->assertCount(1, $this->_sender->send($target, ['id' => 1]));
+		$this->assertCount(1, $this->_sender->send(self::URL, ['id' => 1]));
+	}
+
+	public function testAStringPayloadIsSentAsGiven()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->send(self::URL, '<xml/>');
+
+		$this->assertSame('<xml/>', $this->_client->requests[0]['body']);
+	}
+
+	public function testAFormContentTypeEncodesAsAForm()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->send(
+			[['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']],
+			['id' => 1, 'name' => 'a b']
+		);
+
+		$this->assertSame('id=1&name=a+b', $this->_client->requests[0]['body']);
+	}
+
+	public function testAPayloadThatCannotBeEncodedIsRefused()
+	{
+		$this->expectException(TInvalidDataValueException::class);
+		$this->_sender->send(self::URL, ['bad' => fopen('php://memory', 'r')]);
+	}
+
+	public function testTheTargetsOwnLimitsOverrideTheSenders()
+	{
+		$this->answer(new THttpClientResponse(500));
+		$this->_sender->setMaxAttempts(5);
+		$this->_sender->setRetryDelay(1000);
+
+		$delivery = $this->_sender->send(
+			[['url' => self::URL, 'maxAttempts' => 2, 'retryDelay' => 10]],
+			['id' => 1]
+		)[0];
+
+		$this->assertSame(2, $delivery->getAttempts());
+		$this->assertSame([10], $this->_sender->pauses);
+	}
+
+	public function testTheSignedDeliveryIdIsTheDeliveryIdOnEveryAttempt()
+	{
+		// A scheme left to itself mints a fresh id per call, and a receiver deduplicating on
+		// it would count one retried delivery as several.
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setIdHeader('webhook-id');
+		$signature->setPayloadFormat('{id}.{body}');
+		$this->_sender->setSignature($signature);
+		$this->_sender->setMaxAttempts(3);
+		$this->answer(new THttpClientResponse(500), new THttpClientResponse(500), new THttpClientResponse(200));
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertCount(3, $this->_client->requests);
+		foreach ($this->_client->requests as $index => $request) {
+			$this->assertSame($delivery->getID(), $request['headers']['webhook-id'], 'attempt ' . ($index + 1));
+			$this->assertTrue($signature->verify($this->sent($index)));
+		}
+	}
+
+	public function testATargetsOwnIdHeaderIsNotOverwritten()
+	{
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setIdHeader('webhook-id');
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send(
+			[['url' => self::URL, 'secret' => 's3cret', 'headers' => ['webhook-id' => 'chosen-by-the-app']]],
+			['id' => 1]
+		);
+
+		$this->assertSame('chosen-by-the-app', $this->_client->requests[0]['headers']['webhook-id']);
+	}
+
+	public function testAFormContentTypeNeedsSomethingItCanEncode()
+	{
+		$this->expectException(TInvalidDataValueException::class);
+		$this->_sender->send([['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']], 42);
+	}
+
+	public function testADeliveryRecordsHowLongItTook()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertGreaterThan(0.0, $delivery->getDuration());
+	}
+
+	public function testTheDefaultPauseActuallyWaits()
+	{
+		// TestWebhookSender overrides pause() everywhere else, so the real one is exercised
+		// here rather than never.
+		$sender = new TWebhookSender();
+		$sender->setHttpClient($this->_client);
+		$sender->setMaxAttempts(2);
+		$sender->setRetryDelay(20);
+		$this->answer(new THttpClientResponse(500), new THttpClientResponse(200));
+
+		$started = microtime(true);
+		$sender->send(self::URL, ['id' => 1]);
+
+		$this->assertGreaterThanOrEqual(0.015, microtime(true) - $started);
+	}
+
+	public function testDefaults()
+	{
+		$sender = new TWebhookSender();
+
+		$this->assertSame(10, $sender->getTimeout());
+		$this->assertSame(3, $sender->getMaxAttempts());
+		$this->assertSame(500, $sender->getRetryDelay());
+		$this->assertSame(TWebhookSender::DEFAULT_RETRY_STATUS_CODES, $sender->getRetryStatusCodes());
+		$this->assertSame(TWebhookSender::getDefaultUserAgent(), $sender->getUserAgent());
+		$this->assertNull($sender->getSignature());
+	}
+
+	public function testTheDefaultTransportIsBuiltOnDemandAndDoesNotFollowRedirects()
+	{
+		// A 3xx from a webhook URL is a misconfiguration, and following one would post the
+		// signed body somewhere the subscriber did not name.
+		$sender = new TWebhookSender();
+		$client = $sender->getHttpClient();
+
+		$this->assertInstanceOf(THttpClient::class, $client);
+		$this->assertFalse($client->getFollowRedirects());
+		$this->assertSame($client, $sender->getHttpClient());
+	}
+
+	public function testTheDefaultUserAgentCarriesTheRunningVersion()
+	{
+		// Computed rather than written down, so a release cannot leave a stale number in a
+		// header that receivers log.
+		$this->assertSame(
+			TWebhookSender::USER_AGENT_PRODUCT . '/' . TWebhookModule::getVersion(),
+			TWebhookSender::getDefaultUserAgent()
+		);
+		$this->assertStringStartsWith(TWebhookSender::USER_AGENT_PRODUCT . '/', (new TWebhookSender())->getUserAgent());
+	}
+
+	public function testTheUserAgentGoesBackToTheDefaultWhenCleared()
+	{
+		$sender = new TWebhookSender();
+		$sender->setUserAgent('MyApp/2.0');
+		$this->assertSame('MyApp/2.0', $sender->getUserAgent());
+
+		$sender->setUserAgent('');
+		$this->assertSame(TWebhookSender::getDefaultUserAgent(), $sender->getUserAgent());
+
+		$sender->setUserAgent('MyApp/2.0');
+		$sender->setUserAgent(null);
+		$this->assertSame(TWebhookSender::getDefaultUserAgent(), $sender->getUserAgent());
+	}
+
+	public function testMaxAttemptsIsAtLeastOne()
+	{
+		$sender = new TWebhookSender();
+		$sender->setMaxAttempts(0);
+
+		$this->assertSame(1, $sender->getMaxAttempts());
+	}
+}

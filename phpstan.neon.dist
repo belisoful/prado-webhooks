@@ -1,0 +1,43 @@
+parameters:
+    phpVersion: 80500 # PHP 8.5, the newest runtime the package supports
+    # Level 3 is the floor every extension starts from. Raise it in a package that can carry
+    # it -- belisoful/prado-bayesian runs at level 9 -- but do not lower it here.
+    level: 3
+    bootstrapFiles:
+        - tests/test_tools/phpstan-bootstrap.php
+    paths:
+        - src
+
+# PRADO components resolve methods and properties at runtime (behaviors, dynamic events, and
+# the get/set property convention), which PHPStan cannot see on its own. These extensions ship
+# with the framework and teach it those rules; without them a TComponent subclass reports false
+# positives on every dynamic call and property.
+services:
+    -
+        class: Prado\PHPStan\DynamicMethodsClassReflectionExtension
+        tags:
+            - phpstan.broker.methodsClassReflectionExtension
+    -
+        class: Prado\PHPStan\TComponentPropertiesReflectionExtension
+        tags:
+            - phpstan.broker.propertiesClassReflectionExtension
+    -
+        class: Prado\PHPStan\TComponentHasMethodTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentCanGetPropertyTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentCanSetPropertyTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentIsaTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\PradoMethodVisibleStaticMethodTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.staticMethodTypeSpecifyingExtension

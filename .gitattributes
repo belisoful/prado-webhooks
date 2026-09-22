@@ -1,0 +1,24 @@
+# Keep the distributed package to what an application needs at runtime.
+/.github          export-ignore
+/.gitattributes   export-ignore
+/.gitignore       export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/phpstan.neon.dist export-ignore
+/phpunit.xml      export-ignore
+/tests            export-ignore
+/docs             export-ignore
+/build            export-ignore
+/agents           export-ignore
+/bin              export-ignore
+/AGENTS.md        export-ignore
+/CLAUDE.md        export-ignore
+/CONTRIBUTING.md  export-ignore
+/SECURITY.md      export-ignore
+
+# Normalize line endings for the text sources.
+*.php   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf

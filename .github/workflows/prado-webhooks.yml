@@ -1,0 +1,171 @@
+name: PRADO Extension
+on:
+  push:
+  pull_request:
+  schedule:
+    # The package tracks PRADO's master branch (dev-master), so a change there can break a
+    # build that no commit here triggered. Once a week catches that.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  extension:
+    name: Extension (PHP ${{ matrix.php-versions }}${{ matrix.dependencies == 'lowest' && ', lowest deps' || '' }})
+    runs-on: ubuntu-latest
+
+    # The queue is the one part of this package whose correctness depends on the database
+    # server, and the three disagree in ways that are silent until you run them. MySQL has no
+    # IF NOT EXISTS on CREATE INDEX and needs prepare emulation for a repeated placeholder;
+    # PostgreSQL rejects AUTO_INCREMENT and keeps index names per schema. So the queue suite
+    # runs against all three, and a green build means all three.
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: prado_webhooks
+          MYSQL_DATABASE: prado_webhooks_test
+          MYSQL_USER: prado_webhooks
+          MYSQL_PASSWORD: prado_webhooks
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pprado_webhooks"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: prado_webhooks
+          POSTGRES_PASSWORD: prado_webhooks
+          POSTGRES_DB: prado_webhooks_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U prado_webhooks -d prado_webhooks_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      PRADO_WEBHOOKS_MYSQL_DSN: 'mysql:host=127.0.0.1;port=3306;dbname=prado_webhooks_test'
+      PRADO_WEBHOOKS_MYSQL_USER: prado_webhooks
+      PRADO_WEBHOOKS_MYSQL_PASSWORD: prado_webhooks
+      PRADO_WEBHOOKS_PGSQL_DSN: 'pgsql:host=127.0.0.1;port=5432;dbname=prado_webhooks_test'
+      PRADO_WEBHOOKS_PGSQL_USER: prado_webhooks
+      PRADO_WEBHOOKS_PGSQL_PASSWORD: prado_webhooks
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-versions: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        dependencies: ['highest']
+        include:
+          # The oldest versions the constraints allow, on the oldest PHP: what a consumer with
+          # a conservative lock file gets.
+          - php-versions: '8.1'
+            dependencies: 'lowest'
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v4
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-versions }}
+          extensions: ctype, dom, intl, json, mbstring, pcre, pdo, pdo_mysql, pdo_pgsql, pdo_sqlite, sqlite3, spl, zlib
+          tools: cs2pr
+          # Xdebug costs a lot of run time, so only the leg that measures coverage gets it.
+          coverage: ${{ matrix.php-versions == '8.3' && matrix.dependencies == 'highest' && 'xdebug' || 'none' }}
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          # composer.lock is not committed, so the key hashes composer.json instead.
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php${{ matrix.php-versions }}-${{ matrix.dependencies }}-composer-${{ hashFiles('**/composer.json') }}
+          restore-keys: ${{ runner.os }}-php${{ matrix.php-versions }}-${{ matrix.dependencies }}-composer-
+
+      - name: Install Composer dependencies
+        if: matrix.dependencies == 'highest'
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      # phar-io/composer-distributor (pulled in by phpdocumentor/shim) below 1.0.2 reacts to
+      # every package's install event and tries to download a phpDocumentor release named after
+      # that package's version, which 404s; 1.0.2 filters the events to its own package.
+      - name: Install the lowest Composer dependencies the constraints allow
+        if: matrix.dependencies == 'lowest'
+        run: composer update --no-progress --prefer-dist --prefer-lowest --prefer-stable --optimize-autoloader --with phar-io/composer-distributor:^1.0.2
+
+      - name: Compile check (composer lint)
+        run: composer lint
+
+      - name: Validate code style using php-cs-fixer (composer cs)
+        if: matrix.dependencies == 'highest'
+        run: vendor/bin/php-cs-fixer fix -vvv --dry-run --using-cache=no --format=checkstyle | cs2pr
+
+      - name: Validate code using phpstan (composer stan)
+        if: matrix.dependencies == 'highest'
+        run: vendor/bin/phpstan analyse --memory-limit=512M --error-format=checkstyle | cs2pr
+
+      - name: Run Unit Tests (composer unittest)
+        run: composer unittest
+
+      # A driver whose server is unreachable skips, which would turn a broken service into a
+      # quietly passing build. This fails instead. Only --filter is added; every other option
+      # belongs to phpunit.xml.
+      - name: Check the queue suite really ran against every driver
+        run: |
+          for driver in TSqliteWebhookQueueTest TMysqlWebhookQueueTest TPostgresWebhookQueueTest; do
+            vendor/bin/phpunit --testsuite unit --filter "$driver" | tee "$RUNNER_TEMP/$driver.log"
+            if grep -qi 'skipped' "$RUNNER_TEMP/$driver.log"; then
+              echo "::error::$driver skipped; the service or the environment is wrong"
+              exit 1
+            fi
+          done
+
+      - name: Measure coverage
+        if: matrix.php-versions == '8.3' && matrix.dependencies == 'highest'
+        env:
+          XDEBUG_MODE: coverage
+        run: |
+          composer coverage
+          # Raise this floor as the suite grows; never lower it to make a red build green.
+          php tests/test_tools/check-coverage.php build/logs/clover.xml 90
+
+  integration:
+    name: Composer extension install
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v4
+        with:
+          path: prado-webhooks
+
+      - name: Checkout PRADO framework (4.4 dev)
+        uses: actions/checkout@v4
+        with:
+          repository: pradosoft/prado
+          ref: master
+          path: prado.master
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: ctype, dom, intl, json, mbstring, pcre, pdo, pdo_sqlite, sqlite3, spl, zlib
+
+      # Builds a throwaway consumer project that requires the extension through Composer, then
+      # asserts that extra.prado's error-messages, class-map, and bootstrap all take effect.
+      - name: Verify the Composer extension wiring
+        run: bash prado-webhooks/tests/integration/run-install-test.sh

@@ -1,0 +1,96 @@
+{
+	"name": "belisoful/prado-webhooks",
+	"type": "prado4-extension",
+	"description": "Inbound and outbound webhooks for PRADO: a signature-verifying receiver service and a retrying sender.",
+	"keywords": [
+		"prado",
+		"framework",
+		"extension",
+		"webhook",
+		"webhooks",
+		"hmac",
+		"signature",
+		"rfc9421",
+		"jwt",
+		"cron",
+		"queue"
+	],
+	"homepage": "https://github.com/belisoful/prado-webhooks",
+	"support": {
+		"issues": "https://github.com/belisoful/prado-webhooks/issues",
+		"source": "https://github.com/belisoful/prado-webhooks"
+	},
+	"license": "BSD-3-Clause",
+	"authors": [
+		{
+			"name": "Brad Anderson",
+			"email": "belisoful@icloud.com",
+			"role": "Developer",
+			"homepage": "https://github.com/belisoful"
+		}
+	],
+	"autoload": {
+		"psr-4": {
+			"Belisoful\\Prado\\Web\\Webhooks\\": "src"
+		}
+	},
+	"repositories": [
+		{
+			"type": "composer",
+			"url": "https://asset-packagist.org"
+		}
+	],
+	"require": {
+		"php": ">=8.1.0",
+		"composer-runtime-api": "^2.0",
+		"pradosoft/prado": "^4.4@dev"
+	},
+	"require-dev": {
+		"phpunit/phpunit": "^10",
+		"phpdocumentor/shim": "^3",
+		"friendsofphp/php-cs-fixer": "^3.94",
+		"phpstan/phpstan": "^2.1.22"
+	},
+	"minimum-stability": "dev",
+	"prefer-stable": true,
+	"config": {
+		"platform": {
+			"php": "8.1"
+		},
+		"allow-plugins": {
+			"phpdocumentor/shim": true
+		}
+	},
+	"scripts": {
+		"lint": "find src tests -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null",
+		"fix": "vendor/bin/php-cs-fixer fix --using-cache=no",
+		"cs": "vendor/bin/php-cs-fixer fix --dry-run --using-cache=no --diff",
+		"stan": "vendor/bin/phpstan analyse --memory-limit=512M",
+		"unittest": "vendor/bin/phpunit --testsuite unit",
+		"coverage": "vendor/bin/phpunit --testsuite unit --coverage-text --coverage-clover=build/logs/clover.xml",
+		"integration": "tests/integration/run-install-test.sh",
+		"fulltest": [
+			"@lint",
+			"@cs",
+			"@stan",
+			"@unittest"
+		]
+	},
+	"scripts-descriptions": {
+		"lint": "Compile-check every PHP file under src/ and tests/ with php -l.",
+		"fix": "Apply php-cs-fixer to the source tree.",
+		"cs": "Check code style without changing files (what CI runs).",
+		"stan": "Run PHPStan at the level in phpstan.neon.dist.",
+		"unittest": "Run the unit test suite.",
+		"coverage": "Run the unit tests with a text and Clover coverage report.",
+		"integration": "Install the package into a throwaway consumer project and verify the extra.prado wiring.",
+		"fulltest": "The full check: lint, code style, static analysis, unit tests, in that order."
+	},
+	"extra": {
+		"prado": {
+			"bootstrap": "Belisoful\\Prado\\Web\\Webhooks\\TWebhookModule",
+			"error-messages": "config/errorMessages.txt",
+			"class-map": "config/classes.json"
+		}
+	}
+}
