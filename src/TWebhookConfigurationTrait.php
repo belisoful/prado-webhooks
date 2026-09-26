@@ -24,19 +24,19 @@ use Prado\Xml\TXmlElement;
  * with its signature -- reads them through here, so the two forms cannot drift apart.
  *
  * ```xml
- * <service id="webhooks" class="Belisoful\Prado\Web\Webhooks\TWebhookService">
- *		<webhook id="github">
+ * <service id="webhook" class="Belisoful\Prado\Web\Webhooks\TWebhookService">
+ *		<endpoint id="github">
  *			<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature"
  *				Secret="..." Header="X-Hub-Signature-256" Prefix="sha256=" />
- *		</webhook>
+ *		</endpoint>
  * </service>
  * ```
  *
  * ```php
  * 'services' => [
- *		'webhooks' => [
+ *		'webhook' => [
  *			'class' => TWebhookService::class,
- *			'webhook' => [
+ *			'endpoint' => [
  *				'github' => [
  *					'signature' => [
  *						'class' => THmacWebhookSignature::class,
@@ -47,6 +47,10 @@ use Prado\Xml\TXmlElement;
  *		],
  * ],
  * ```
+ *
+ * The PHP form is held to the same rules as the XML one: a child keyed by a number is a
+ * list where a map was meant, and a child that is not an array is a typo, and either is
+ * refused rather than built as an empty -- and so unguarded -- component.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
@@ -62,7 +66,9 @@ trait TWebhookConfigurationTrait
 	 *
 	 * @param mixed $config this component's own configuration.
 	 * @param string $tag the child element name, or array key, to collect.
-	 * @throws \Prado\Exceptions\TConfigurationException when an XML child declares no id.
+	 * @throws \Prado\Exceptions\TConfigurationException when a child declares no id -- an
+	 *   XML element without the attribute, or a PHP child keyed by a number -- or a PHP
+	 *   child is not an array.
 	 * @return array<string, array<string, mixed>|\Prado\Xml\TXmlElement> id => configuration.
 	 */
 	protected function childConfigurations(mixed $config, string $tag): array
@@ -78,7 +84,13 @@ trait TWebhookConfigurationTrait
 			}
 		} elseif (is_array($config) && is_array($config[$tag] ?? null)) {
 			foreach ($config[$tag] as $id => $child) {
-				$children[(string) $id] = is_array($child) ? $child : [];
+				if (is_int($id)) {
+					throw new TConfigurationException('webhooks_child_id_required', $tag, static::class);
+				}
+				if (!is_array($child)) {
+					throw new TConfigurationException('webhooks_child_invalid', $id, $tag, static::class);
+				}
+				$children[(string) $id] = $child;
 			}
 		}
 
@@ -93,6 +105,7 @@ trait TWebhookConfigurationTrait
 	 *
 	 * @param mixed $config this component's own configuration.
 	 * @param string $tag the child element name, or array key, to collect.
+	 * @throws \Prado\Exceptions\TConfigurationException when a PHP child is not an array.
 	 * @return array<int, array<string, mixed>|\Prado\Xml\TXmlElement> the configurations.
 	 */
 	protected function childConfigurationList(mixed $config, string $tag): array
@@ -103,8 +116,11 @@ trait TWebhookConfigurationTrait
 				$children[] = $child;
 			}
 		} elseif (is_array($config) && is_array($config[$tag] ?? null)) {
-			foreach ($config[$tag] as $child) {
-				$children[] = is_array($child) ? $child : [];
+			foreach ($config[$tag] as $index => $child) {
+				if (!is_array($child)) {
+					throw new TConfigurationException('webhooks_child_invalid', (string) $index, $tag, static::class);
+				}
+				$children[] = $child;
 			}
 		}
 

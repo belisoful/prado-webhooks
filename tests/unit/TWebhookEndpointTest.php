@@ -6,6 +6,7 @@ use Belisoful\Prado\Web\Webhooks\TWebhookEndpoint;
 use Belisoful\Prado\Web\Webhooks\TWebhookEventParameter;
 use Belisoful\Prado\Web\Webhooks\TWebhookRequest;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\Xml\TXmlDocument;
 
 /**
@@ -364,5 +365,168 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$this->assertSame(TWebhookEndpoint::DEFAULT_MAX_BODY_SIZE, $endpoint->getMaxBodySize());
 		$this->assertTrue($endpoint->getRequireJson());
 		$this->assertSame(TWebhookEndpoint::DEFAULT_SUCCESS_STATUS, $endpoint->getSuccessStatus());
+	}
+
+	public function testARefusedDeliveryIsNeverDecoded()
+	{
+		// Method, size and signature are decided on the bytes alone; the body is parsed only
+		// once it has earned it, so an unauthenticated caller cannot make the endpoint build
+		// a multi-megabyte array.
+		$this->assertFalse($this->handle('GET', self::BODY)->getPayloadDecoded());
+
+		$this->_endpoint->setMaxBodySize(4);
+		$this->assertFalse($this->handle('POST', self::BODY)->getPayloadDecoded());
+		$this->_endpoint->setMaxBodySize(0);
+
+		$verifier = new TestWebhookVerifier();
+		$verifier->answer = false;
+		$this->_endpoint->setVerifier($verifier);
+		$this->assertFalse($this->handle('POST', self::BODY)->getPayloadDecoded());
+
+		$verifier->answer = true;
+		$param = $this->handle('POST', self::BODY);
+		$this->assertTrue($param->getPayloadDecoded());
+		$this->assertTrue($param->getAccepted());
+	}
+
+	public function testAcceptedIsFalseForEveryRefusal()
+	{
+		$this->assertFalse($this->handle('GET', self::BODY)->getAccepted());
+		$this->assertFalse($this->handle('POST', 'not json')->getAccepted());
+
+		$verifier = new TestWebhookVerifier();
+		$verifier->answer = false;
+		$this->_endpoint->setVerifier($verifier);
+		$this->assertFalse($this->handle('POST', self::BODY)->getAccepted());
+	}
+
+	public function testReadingThePayloadOfARefusedDeliveryDecodesItOnDemand()
+	{
+		$param = $this->handle('GET', self::BODY);
+
+		$this->assertFalse($param->getPayloadDecoded());
+		$this->assertSame('opened', $param['action']);
+		$this->assertTrue($param->getPayloadDecoded());
+	}
+
+	public function testHostileBodiesAreRefusedWithAStatusAndNeverThrow()
+	{
+		$this->assertSame(400, $this->handle('POST', "{\"a\":\"\xB1\x31\"}")->getStatusCode());
+		$this->assertSame(400, $this->handle('POST', str_repeat('[', 600) . str_repeat(']', 600))->getStatusCode());
+		$this->assertSame(400, $this->handle('POST', '')->getStatusCode());
+		$this->assertSame(400, $this->handle('POST', '{"a":')->getStatusCode());
+	}
+
+	public function testAScalarOrNullJsonBodyIsJson()
+	{
+		// RequireJson asks whether the body is JSON, not whether it is an object; the literal
+		// null is JSON, and a handler that wanted an object checks for one.
+		$param = $this->handle('POST', '123');
+		$this->assertSame(204, $param->getStatusCode());
+		$this->assertSame(123, $param->getPayload());
+		$this->assertNull($param['anything']);
+
+		$param = $this->handle('POST', 'null');
+		$this->assertSame(204, $param->getStatusCode());
+		$this->assertTrue($param->getPayloadIsJson());
+		$this->assertNull($param->getPayload());
+	}
+
+	public function testAPayloadSetByHandIsNotDecodedOver()
+	{
+		$param = new TWebhookEventParameter($this->_endpoint, new TWebhookRequest('POST', self::BODY));
+		$param->setParameter(['replaced' => true]);
+
+		$this->assertTrue($param->getPayloadDecoded());
+		$this->assertSame(['replaced' => true], $param->getPayload());
+		$this->assertTrue($param['replaced']);
+	}
+
+	public function testAnUnencodableResponseBodyIsRefusedRatherThanSentEmpty()
+	{
+		$param = new TWebhookEventParameter($this->_endpoint, new TWebhookRequest('POST', '{}'));
+
+		$this->expectException(TInvalidDataValueException::class);
+		$param->setResponseBody(['bad' => "\xB1\x31"]);
+	}
+
+	public function testTheResponseContentTypeFollowsTheBodyUnlessSet()
+	{
+		$param = new TWebhookEventParameter($this->_endpoint, new TWebhookRequest('POST', '{}'));
+		$this->assertSame('application/json', $param->getResponseContentType());
+
+		$param->setResponseBody('queued');
+		$this->assertSame('text/plain', $param->getResponseContentType());
+
+		$param->setResponseBody(['ok' => true]);
+		$this->assertSame('application/json', $param->getResponseContentType());
+
+		$param->setResponseContentType('text/csv');
+		$this->assertSame('text/csv', $param->getResponseContentType());
+
+		$param->setResponseContentType('');
+		$this->assertSame('application/json', $param->getResponseContentType());
+	}
+
+	public function testAStatusOutsideTheHttpRangeIsRefused()
+	{
+		$param = new TWebhookEventParameter($this->_endpoint, new TWebhookRequest('POST', '{}'));
+		$param->setStatusCode(299);
+		$this->assertSame(299, $param->getStatusCode());
+
+		$this->expectException(TInvalidDataValueException::class);
+		$param->setStatusCode(0);
+	}
+
+	public function testASuccessStatusThatIsNotAStatusIsAConfigurationError()
+	{
+		// "ok" would coerce to 0 and become an error page on every accepted delivery.
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->setSuccessStatus('ok');
+	}
+
+	public function testAnUnknownChildElementIsRefused()
+	{
+		// <signatrue> would otherwise be ignored, leaving an endpoint that accepts everything.
+		$xml = new TXmlDocument();
+		$xml->loadFromString(
+			'<endpoint id="x"><signatrue class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" /></endpoint>'
+		);
+
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->init($xml);
+	}
+
+	public function testAnUnknownPhpChildKeyIsRefused()
+	{
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->init(['signatrue' => ['class' => THmacWebhookSignature::class]]);
+	}
+
+	public function testRequireVerifierFailsAtBootWithoutASignatureChild()
+	{
+		$this->_endpoint->setRequireVerifier(true);
+		$xml = new TXmlDocument();
+		$xml->loadFromString('<endpoint id="x" />');
+
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->init($xml);
+	}
+
+	public function testRequireVerifierFailsOnTheFirstRequestWhenRegisteredFromPhp()
+	{
+		$this->_endpoint->setRequireVerifier(true);
+		$this->assertTrue($this->_endpoint->getRequireVerifier());
+
+		$this->expectException(TConfigurationException::class);
+		$this->handle('POST', '{}');
+	}
+
+	public function testRequireVerifierIsSatisfiedByAVerifier()
+	{
+		$this->_endpoint->setRequireVerifier(true);
+		$this->_endpoint->setVerifier(new TestWebhookVerifier());
+
+		$this->assertSame(204, $this->handle('POST', '{}')->getStatusCode());
 	}
 }

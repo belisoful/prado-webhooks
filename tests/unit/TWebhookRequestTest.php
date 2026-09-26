@@ -120,4 +120,37 @@ class TWebhookRequestTest extends PHPUnit\Framework\TestCase
 		$this->assertSame([], $request->getParameters());
 		$this->assertNull($request->getRemoteAddress());
 	}
+
+	public function testAQueryWithMorePairsThanPhpAllowsReadsAsEmptyRatherThanThrowing()
+	{
+		// parse_str warns past max_input_vars and PRADO turns the warning into an exception;
+		// the URL is the caller's, so that would be a 500 anyone could cause.
+		$limit = (int) ini_get('max_input_vars');
+		$this->assertGreaterThan(0, $limit, 'the test needs a max_input_vars limit to exceed');
+		$pairs = ['key=x'];
+		for ($i = 0; $i <= $limit; $i++) {
+			$pairs[] = "p$i=1";
+		}
+		$request = new TWebhookRequest('POST', '{}', [], 'https://example.com/hook?' . implode('&', $pairs));
+
+		$this->assertSame([], $request->getQueryParameters());
+	}
+
+	public function testAQueryAtTheLimitStillParses()
+	{
+		$limit = (int) ini_get('max_input_vars');
+		$pairs = [];
+		for ($i = 1; $i <= $limit; $i++) {
+			$pairs[] = "p$i=$i";
+		}
+		$request = new TWebhookRequest('POST', '{}', [], 'https://example.com/hook?' . implode('&', $pairs));
+
+		$this->assertCount($limit, $request->getQueryParameters());
+	}
+
+	public function testAUrlThatWillNotParseHasNoQueryParameters()
+	{
+		$this->assertSame([], (new TWebhookRequest('POST', '{}', [], 'http:///nohost?a=1'))->getQueryParameters());
+		$this->assertSame([], (new TWebhookRequest('POST', '{}', [], ''))->getQueryParameters());
+	}
 }

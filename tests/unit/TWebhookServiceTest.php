@@ -7,6 +7,7 @@ use Belisoful\Prado\Web\Webhooks\TWebhookEventParameter;
 use Belisoful\Prado\Web\Webhooks\TWebhookRequest;
 use Belisoful\Prado\Web\Webhooks\TWebhookService;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\Xml\TXmlDocument;
 
 /**
@@ -15,13 +16,15 @@ use Prado\Xml\TXmlDocument;
 class TestWebhookResponse
 {
 	public int $statusCode = 200;
+	public ?string $reason = null;
 	public array $appendedHeaders = [];
 	public ?string $contentType = null;
 	public string $body = '';
 
-	public function setStatusCode($value): void
+	public function setStatusCode($value, $reason = null): void
 	{
 		$this->statusCode = (int) $value;
+		$this->reason = $reason;
 	}
 
 	public function appendHeader($value): void
@@ -53,6 +56,7 @@ class TestWebhookService extends TWebhookService
 	public string $requestUrl = 'https://example.com/index.php';
 	public array $requestParameters = [];
 	public ?string $remoteAddress = '192.0.2.1';
+	public int $bodyReads = 0;
 	public TestWebhookResponse $response;
 
 	public function __construct()
@@ -83,6 +87,8 @@ class TestWebhookService extends TWebhookService
 
 	protected function readBody(): string
 	{
+		$this->bodyReads++;
+
 		return $this->requestBody;
 	}
 
@@ -99,6 +105,93 @@ class TestWebhookService extends TWebhookService
 	protected function getRemoteAddress(): ?string
 	{
 		return $this->remoteAddress;
+	}
+}
+
+/**
+ * Stands in for THttpRequest: the framework's view of the environment, as the service's
+ * default readers see it. Only the methods the service calls exist.
+ */
+class TestFrameworkRequest
+{
+	public string $serviceParameter = 'github';
+	public string $requestType = 'post';
+	public array $headers = ['X-GitHub-Event' => 'push'];
+	public string $baseUrl = 'https://example.com';
+	public string $requestUri = '/index.php?webhook=github&page=1';
+	public array $items = ['webhook' => 'github', 'page' => '1', 'nested' => ['a' => 'b']];
+	public string $userHostAddress = '192.0.2.7';
+
+	public function getServiceParameter()
+	{
+		return $this->serviceParameter;
+	}
+
+	public function getRequestType()
+	{
+		return $this->requestType;
+	}
+
+	public function getHeaders($case = null)
+	{
+		return $this->headers;
+	}
+
+	public function getBaseUrl()
+	{
+		return $this->baseUrl;
+	}
+
+	public function getRequestUri()
+	{
+		return $this->requestUri;
+	}
+
+	public function toArray()
+	{
+		return $this->items;
+	}
+
+	public function getUserHostAddress()
+	{
+		return $this->userHostAddress;
+	}
+}
+
+/**
+ * The service with only the framework's request and response replaced, so its own readers
+ * of the environment -- the ones TestWebhookService overrides -- are what runs.
+ */
+class TestEnvironmentWebhookService extends TWebhookService
+{
+	public TestFrameworkRequest $request;
+	public TestWebhookResponse $response;
+
+	public function __construct()
+	{
+		$this->request = new TestFrameworkRequest();
+		$this->response = new TestWebhookResponse();
+		parent::__construct();
+	}
+
+	public function getRequest()
+	{
+		return $this->request;
+	}
+
+	public function getResponse()
+	{
+		return $this->response;
+	}
+
+	public function buildRequest(bool $withBody = true): TWebhookRequest
+	{
+		return $this->createWebhookRequest($withBody);
+	}
+
+	public function declaredBodySize(): ?int
+	{
+		return $this->getDeclaredBodySize();
 	}
 }
 
@@ -488,5 +581,296 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 
 		$this->_service->setDefaultEndpoint('');
 		$this->assertNull($this->_service->getDefaultEndpoint());
+	}
+
+	public function testTheServiceEventIsSilentForARefusedDelivery()
+	{
+		// The documented contract is "once per verified delivery"; a handler written to it
+		// would otherwise act on a forged payload, and could overwrite the 401 with a 2xx.
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$this->endpoint('github')->setVerifier($signature);
+		$accepted = [];
+		$refused = [];
+		$this->_service->onWebhook[] = function ($sender, TWebhookEventParameter $param) use (&$accepted) {
+			$accepted[] = $param->getStatusCode();
+		};
+		$this->_service->onRefused[] = function ($sender, TWebhookEventParameter $param) use (&$refused) {
+			$refused[] = [$param->getStatusCode(), $param->getPayloadDecoded(), $param->getAccepted()];
+		};
+		$this->_service->serviceParameter = 'github';
+
+		$this->_service->requestBody = '{"action":"opened"}';
+		$this->_service->requestHeaders = [THmacWebhookSignature::DEFAULT_HEADER => 'deadbeef'];
+		$this->_service->run();
+		$this->assertSame(401, $this->_service->response->statusCode);
+
+		$this->_service->method = 'GET';
+		$this->_service->run();
+		$this->assertSame(405, $this->_service->response->statusCode);
+		$this->_service->method = 'POST';
+
+		$this->_service->getEndpoint('github')->setMaxBodySize(4);
+		$this->_service->requestHeaders = $signature->sign(new TWebhookRequest('POST', '{"action":"opened"}'));
+		$this->_service->run();
+		$this->assertSame(413, $this->_service->response->statusCode);
+		$this->_service->getEndpoint('github')->setMaxBodySize(0);
+
+		$this->_service->requestBody = 'not json';
+		$this->_service->requestHeaders = $signature->sign(new TWebhookRequest('POST', 'not json'));
+		$this->_service->run();
+		$this->assertSame(400, $this->_service->response->statusCode);
+
+		$this->assertSame([], $accepted);
+		$this->assertSame([[401, false, false], [405, false, false], [413, false, false], [400, true, false]], $refused);
+	}
+
+	public function testARefusalHandlerCannotTurnARefusalIntoASuccess()
+	{
+		$this->endpoint('github');
+		$this->_service->onRefused[] = function ($sender, TWebhookEventParameter $param) {
+			$param->setStatusCode(200);
+		};
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->method = 'GET';
+		$this->_service->run();
+
+		$this->assertSame(405, $this->_service->response->statusCode);
+	}
+
+	public function testARefusalHandlerMayChooseAnotherRefusal()
+	{
+		$this->endpoint('github');
+		$this->_service->onRefused[] = function ($sender, TWebhookEventParameter $param) {
+			$param->setStatusCode(429);
+		};
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->method = 'GET';
+		$this->_service->run();
+
+		$this->assertSame(429, $this->_service->response->statusCode);
+	}
+
+	public function testADeclaredOversizedBodyIsRefusedBeforeItIsRead()
+	{
+		$this->endpoint('github')->setMaxBodySize(10);
+		$refused = [];
+		$this->_service->onRefused[] = function ($sender, TWebhookEventParameter $param) use (&$refused) {
+			$refused[] = $param->getStatusCode();
+		};
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestHeaders = ['Content-Length' => '11'];
+		$this->_service->requestBody = str_repeat('x', 11);
+		$this->_service->run();
+
+		$this->assertSame(413, $this->_service->response->statusCode);
+		$this->assertSame(0, $this->_service->bodyReads);
+		$this->assertSame([413], $refused);
+	}
+
+	public function testADeclaredLengthWithinTheLimitIsReadAndAMisdeclaredOneIsCaughtByTheEndpoint()
+	{
+		$this->endpoint('github')->setMaxBodySize(10);
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestHeaders = ['content-length' => '2'];
+		$this->_service->requestBody = '{}';
+		$this->_service->run();
+		$this->assertSame(204, $this->_service->response->statusCode);
+		$this->assertSame(1, $this->_service->bodyReads);
+
+		// A liar declares 2 and sends 11: the endpoint's own check still refuses it.
+		$this->_service->requestBody = str_repeat('x', 11);
+		$this->_service->run();
+		$this->assertSame(413, $this->_service->response->statusCode);
+	}
+
+	public function testAContentLengthThatIsNotANumberIsIgnored()
+	{
+		$this->endpoint('github')->setMaxBodySize(10);
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestHeaders = ['Content-Length' => 'lots'];
+		$this->_service->requestBody = '{}';
+		$this->_service->run();
+
+		$this->assertSame(204, $this->_service->response->statusCode);
+	}
+
+	public function testABodyOnTheDefaultStatusIsAnsweredAsTwoHundred()
+	{
+		// A 204 cannot carry a body; a handler that set one meant 200.
+		$this->endpoint('github')->onWebhook[] = function ($sender, $param) {
+			$param->setResponseBody('queued');
+		};
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestBody = '{}';
+		$this->_service->run();
+
+		$this->assertSame(200, $this->_service->response->statusCode);
+		$this->assertSame('text/plain', $this->_service->response->contentType);
+		$this->assertSame('queued', $this->_service->response->body);
+	}
+
+	public function testAStatusTheFrameworkHasNoPhraseForIsSentWithOne()
+	{
+		$this->endpoint('github')->onWebhook[] = function ($sender, $param) {
+			$param->setStatusCode(299);
+		};
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestBody = '{}';
+		$this->_service->run();
+
+		$this->assertSame(299, $this->_service->response->statusCode);
+		$this->assertSame(TWebhookService::STATUS_REASON, $this->_service->response->reason);
+	}
+
+	public function testAListShapedPhpEndpointConfigurationIsRefused()
+	{
+		// ['github'] is a list where a map was meant; it would build an open endpoint at ?webhook=0.
+		$this->expectException(TConfigurationException::class);
+		$this->_service->init(['endpoint' => ['github']]);
+	}
+
+	public function testAPhpEndpointThatIsNotAnArrayIsRefused()
+	{
+		$this->expectException(TConfigurationException::class);
+		$this->_service->init(['endpoint' => ['github' => null]]);
+	}
+
+	public function testAnEndpointWithAnUnknownChildIsRefusedAtBoot()
+	{
+		$this->expectException(TConfigurationException::class);
+		$this->_service->init($this->xml(
+			'<service id="webhook"><endpoint id="github">'
+			. '<signatrue class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" />'
+			. '</endpoint></service>'
+		));
+	}
+
+	public function testRequireVerifierIsHonoredFromTheConfiguration()
+	{
+		$this->_service->init($this->xml(
+			'<service id="webhook"><endpoint id="github" RequireVerifier="true">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" />'
+			. '</endpoint></service>'
+		));
+		$this->assertTrue($this->_service->getEndpoint('github')->getRequireVerifier());
+
+		$this->expectException(TConfigurationException::class);
+		$this->_service->init($this->xml(
+			'<service id="webhook"><endpoint id="stripe" RequireVerifier="true" /></service>'
+		));
+	}
+
+	public function testASuccessStatusThatIsNotAStatusIsRefusedAtBoot()
+	{
+		$this->expectException(TConfigurationException::class);
+		$this->_service->init($this->xml(
+			'<service id="webhook"><endpoint id="github" SuccessStatus="ok" /></service>'
+		));
+	}
+
+	public function testAHandlerSettingAnImpossibleStatusIsToldSo()
+	{
+		$this->endpoint('github')->onWebhook[] = function ($sender, $param) {
+			$param->setStatusCode(0);
+		};
+
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestBody = '{}';
+
+		$this->expectException(TInvalidDataValueException::class);
+		$this->_service->run();
+	}
+
+	public function testTheDefaultReadersAssembleTheRequestFromTheFramework()
+	{
+		$service = new TestEnvironmentWebhookService();
+		$request = $service->buildRequest();
+
+		$this->assertSame('POST', $request->getMethod());
+		$this->assertSame('', $request->getBody(), 'php://input is empty on the command line');
+		$this->assertSame('push', $request->getHeader('x-github-event'));
+		$this->assertSame('https://example.com/index.php?webhook=github&page=1', $request->getUrl());
+		// Only scalars: a nested parameter has no serialization a scheme could sign.
+		$this->assertSame(['webhook' => 'github', 'page' => '1'], $request->getParameters());
+		$this->assertSame('192.0.2.7', $request->getRemoteAddress());
+
+		$service->request->userHostAddress = '';
+		$this->assertNull($service->buildRequest()->getRemoteAddress());
+	}
+
+	public function testContentHeadersCgiKeepsOutOfHttpAreRestored()
+	{
+		// php-fpm hands Content-Type and Content-Length to PHP without the HTTP_ prefix, so the
+		// framework's header map lacks them; a scheme covering either would then fail there
+		// and pass under Apache.
+		$saved = [$_SERVER['CONTENT_TYPE'] ?? null, $_SERVER['CONTENT_LENGTH'] ?? null];
+		$_SERVER['CONTENT_TYPE'] = 'application/json';
+		$_SERVER['CONTENT_LENGTH'] = '17';
+		try {
+			$service = new TestEnvironmentWebhookService();
+			$request = $service->buildRequest();
+			$this->assertSame('application/json', $request->getHeader('Content-Type'));
+			$this->assertSame('17', $request->getHeader('Content-Length'));
+			$this->assertSame(17, $service->declaredBodySize());
+
+			// One the server did put in the map is left alone rather than overwritten.
+			$service->request->headers['content-type'] = 'text/plain';
+			$request = $service->buildRequest();
+			$this->assertSame('text/plain', $request->getHeader('Content-Type'));
+			$this->assertCount(3, $request->getHeaders());
+		} finally {
+			foreach (['CONTENT_TYPE', 'CONTENT_LENGTH'] as $i => $key) {
+				if ($saved[$i] === null) {
+					unset($_SERVER[$key]);
+				} else {
+					$_SERVER[$key] = $saved[$i];
+				}
+			}
+		}
+	}
+
+	public function testTheDeclaredBodySizeIsNullWhenAbsentOrNotANumber()
+	{
+		$service = new TestEnvironmentWebhookService();
+		$this->assertNull($service->declaredBodySize());
+
+		$service->request->headers['Content-Length'] = 'many';
+		$this->assertNull($service->declaredBodySize());
+
+		$service->request->headers['Content-Length'] = ' 42 ';
+		$this->assertSame(42, $service->declaredBodySize());
+	}
+
+	public function testARequestBuiltWithoutABodyHasNone()
+	{
+		$service = new TestEnvironmentWebhookService();
+		$this->assertSame('', $service->buildRequest(false)->getBody());
+	}
+
+	public function testTheDefaultReadersRunARequestEndToEnd()
+	{
+		$service = new TestEnvironmentWebhookService();
+		$endpoint = new TWebhookEndpoint();
+		$endpoint->setID('github');
+		$endpoint->setRequireJson(false);
+		$endpoint->setEventHeader('X-GitHub-Event');
+		$service->addEndpoint($endpoint);
+		$seen = [];
+		$endpoint->onWebhook[] = function ($sender, TWebhookEventParameter $param) use (&$seen) {
+			$seen[] = $param->getEvent();
+		};
+
+		$service->run();
+
+		$this->assertSame(['push'], $seen);
+		$this->assertSame(204, $service->response->statusCode);
 	}
 }

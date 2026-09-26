@@ -226,12 +226,24 @@ class TWebhookRequest extends TComponent
 	}
 
 	/**
-	 * @return array<string, string> the parameters of the URL's query string alone.
+	 * Returns the parameters of the URL's query string alone.
+	 *
+	 * The URL is the caller's, so the query is bounded before it is parsed: `parse_str`
+	 * warns past `max_input_vars`, PRADO turns the warning into an exception, and an
+	 * exception here would be a 500 that anyone can cause. A query with more pairs than
+	 * the limit reads as empty instead, and a scheme that needed one of them refuses.
+	 *
+	 * @return array<string, string> the query parameters, or none when there are more than
+	 *   `max_input_vars` of them.
 	 */
 	public function getQueryParameters(): array
 	{
-		$query = (string) parse_url($this->_url, PHP_URL_QUERY);
-		if ($query === '') {
+		$query = parse_url($this->_url, PHP_URL_QUERY);
+		if (!is_string($query) || $query === '') {
+			return [];
+		}
+		$limit = (int) ini_get('max_input_vars');
+		if ($limit > 0 && count(explode('&', $query)) > $limit) {
 			return [];
 		}
 		parse_str($query, $parameters);

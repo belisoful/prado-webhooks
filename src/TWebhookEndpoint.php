@@ -14,6 +14,7 @@ use Belisoful\Prado\Web\Webhooks\Signature\IWebhookVerifier;
 use Prado\Exceptions\TConfigurationException;
 use Prado\TApplicationComponent;
 use Prado\TPropertyValue;
+use Prado\Xml\TXmlElement;
 
 /**
  * TWebhookEndpoint class.
@@ -54,7 +55,14 @@ use Prado\TPropertyValue;
  *
  * The checks run in the order that leaks least: the method, then the size, then the
  * signature, and only then anything that reads the payload. Nothing that depends on the
- * body's *content* happens before the signature has been verified.
+ * body's *content* happens before the signature has been verified; the body is not even
+ * decoded until then.
+ *
+ * An endpoint with no `signature` child accepts every request that reaches it. That is
+ * deliberate, for a URL something in front of the application already guards, but it is
+ * also what a misspelled child element would silently produce -- so an unknown child is
+ * refused at configuration time, and {@see setRequireVerifier RequireVerifier} makes the
+ * absence of a verifier a configuration error rather than an open door.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
@@ -70,6 +78,12 @@ class TWebhookEndpoint extends TApplicationComponent
 	/** @var int the largest body accepted by default, in bytes. */
 	public const DEFAULT_MAX_BODY_SIZE = 1048576;
 
+	/** @var string the one child element an endpoint is configured with. */
+	public const SIGNATURE_TAG = 'signature';
+
+	/** @var string[] the keys a PHP endpoint configuration may carry besides its children. */
+	protected const CONFIGURATION_KEYS = ['class', 'properties', 'id'];
+
 	/** @var null|string the id this endpoint answers at */
 	private ?string $_id = null;
 
@@ -78,6 +92,9 @@ class TWebhookEndpoint extends TApplicationComponent
 
 	/** @var null|\Belisoful\Prado\Web\Webhooks\Signature\IWebhookVerifier how a request is authenticated */
 	private ?IWebhookVerifier $_verifier = null;
+
+	/** @var bool whether an endpoint without a verifier is a configuration error */
+	private bool $_requireVerifier = false;
 
 	/** @var string[] the HTTP methods the endpoint accepts, upper case */
 	private array $_methods = ['POST'];
@@ -105,10 +122,50 @@ class TWebhookEndpoint extends TApplicationComponent
 	 */
 	public function init($config): void
 	{
-		if (($signature = $this->childConfiguration($config, 'signature')) !== null) {
+		$this->assertKnownChildren($config);
+		if (($signature = $this->childConfiguration($config, self::SIGNATURE_TAG)) !== null) {
 			/** @var \Belisoful\Prado\Web\Webhooks\Signature\IWebhookVerifier $verifier */
 			$verifier = $this->createConfigured($signature, IWebhookVerifier::class);
 			$this->setVerifier($verifier);
+		}
+		if ($this->_requireVerifier && $this->_verifier === null) {
+			throw new TConfigurationException('webhooks_verifier_required', (string) $this->_id, static::class);
+		}
+	}
+
+	/**
+	 * Refuses a configuration carrying a child this endpoint does not read.
+	 *
+	 * The only child is `signature`, and a `signatrue` would otherwise be ignored -- which
+	 * leaves an endpoint that accepts everything and reports it verified. Fail at boot
+	 * instead.
+	 *
+	 * @param mixed $config the endpoint's configuration.
+	 * @throws \Prado\Exceptions\TConfigurationException when an unknown child is present.
+	 */
+	protected function assertKnownChildren(mixed $config): void
+	{
+		$unknown = [];
+		if ($config instanceof TXmlElement) {
+			foreach ($config->getElements() as $element) {
+				if ($element->getTagName() !== self::SIGNATURE_TAG) {
+					$unknown[] = $element->getTagName();
+				}
+			}
+		} elseif (is_array($config)) {
+			foreach (array_keys($config) as $key) {
+				if ($key !== self::SIGNATURE_TAG && !in_array($key, static::CONFIGURATION_KEYS, true)) {
+					$unknown[] = (string) $key;
+				}
+			}
+		}
+		if ($unknown !== []) {
+			throw new TConfigurationException(
+				'webhooks_child_unknown',
+				implode(', ', $unknown),
+				static::class,
+				self::SIGNATURE_TAG
+			);
 		}
 	}
 
@@ -128,6 +185,9 @@ class TWebhookEndpoint extends TApplicationComponent
 	 */
 	public function handle(TWebhookRequest $request): TWebhookEventParameter
 	{
+		if ($this->_requireVerifier && $this->_verifier === null) {
+			throw new TConfigurationException('webhooks_verifier_required', (string) $this->_id, static::class);
+		}
 		$param = new TWebhookEventParameter($this, $request);
 
 		if (!in_array($request->getMethod(), $this->_methods, true)) {
@@ -147,13 +207,16 @@ class TWebhookEndpoint extends TApplicationComponent
 		}
 		$param->setVerified(true);
 
-		if ($this->_requireJson && $param->getPayload() === null) {
+		// The first thing that reads the body's content, and it runs only now.
+		$param->decodePayload();
+		if ($this->_requireJson && !$param->getPayloadIsJson()) {
 			$param->setStatusCode(400);
 
 			return $param;
 		}
 
 		// Set before raising, so a handler can answer with something else.
+		$param->setAccepted(true);
 		$param->setStatusCode($this->_successStatus);
 		$this->onWebhook($param);
 
@@ -221,6 +284,28 @@ class TWebhookEndpoint extends TApplicationComponent
 	public function setVerifier(?IWebhookVerifier $value): void
 	{
 		$this->_verifier = $value;
+	}
+
+	/**
+	 * @return bool whether an endpoint with no verifier is a configuration error. Defaults
+	 *   to false.
+	 * @since 0.2.0
+	 */
+	public function getRequireVerifier(): bool
+	{
+		return $this->_requireVerifier;
+	}
+
+	/**
+	 * Makes the absence of a verifier a configuration error, so that an endpoint whose
+	 * `signature` child went missing fails at boot -- or, if it was registered from PHP,
+	 * on its first request -- rather than accepting everything.
+	 * @param mixed $value whether a verifier is required.
+	 * @since 0.2.0
+	 */
+	public function setRequireVerifier($value): void
+	{
+		$this->_requireVerifier = TPropertyValue::ensureBoolean($value);
 	}
 
 	/**
@@ -340,10 +425,17 @@ class TWebhookEndpoint extends TApplicationComponent
 
 	/**
 	 * @param mixed $value the status a handled request answers with, before any handler
-	 *   changes it.
+	 *   changes it; 100 to 599.
+	 * @throws \Prado\Exceptions\TConfigurationException when $value is not a status code.
+	 *   A `SuccessStatus="ok"` would otherwise coerce to 0 and become an error page on
+	 *   every accepted delivery.
 	 */
 	public function setSuccessStatus($value): void
 	{
-		$this->_successStatus = TPropertyValue::ensureInteger($value);
+		$status = TPropertyValue::ensureInteger($value);
+		if ($status < 100 || $status > 599) {
+			throw new TConfigurationException('webhooks_status_invalid', (string) $value);
+		}
+		$this->_successStatus = $status;
 	}
 }
