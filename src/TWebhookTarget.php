@@ -13,6 +13,7 @@ namespace Belisoful\Prado\Web\Webhooks;
 use Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner;
 use Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidOperationException;
 use Prado\TApplicationComponent;
 use Prado\TPropertyValue;
 use Prado\Web\THttpHeaderName;
@@ -46,6 +47,31 @@ use Prado\Web\TMediaType;
  * again -- a subscription id, a row -- back to it in the delivery events; nothing in this
  * package reads it.
  *
+ * ## Refusing URLs
+ *
+ * {@see setUrl Url} accepts any absolute `http` or `https` URL, and a subscriber choosing the
+ * URL chooses where the application posts: an internal address, a metadata service, the
+ * application itself. An application that lets users subscribe should install a
+ * {@see setUrlValidator UrlValidator}, one callable for the whole process, and every target
+ * built afterwards is checked against it. One that refuses the private, loopback and
+ * link-local ranges when the host is written as an address:
+ *
+ * ```php
+ * TWebhookTarget::setUrlValidator(static function (string $url): bool {
+ *		$host = trim((string) parse_url($url, PHP_URL_HOST), '[]');
+ *		if (filter_var($host, FILTER_VALIDATE_IP) === false) {
+ *			return true;   // a name: resolve it here and check what it resolves to, or refuse names
+ *		}
+ *		// Refuses 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16,
+ *		// ::1, fc00::/7 and fe80::/10, among others.
+ *		return filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+ * });
+ * ```
+ *
+ * This package resolves no names itself: which resolver to trust, and what to do about a
+ * name that resolves to a private address only on the second lookup, are the application's
+ * decisions.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
  */
@@ -56,6 +82,9 @@ class TWebhookTarget extends TApplicationComponent
 
 	/** @var string the header carrying the delivery id, by default. */
 	public const DEFAULT_DELIVERY_HEADER = 'X-Webhook-Delivery';
+
+	/** @var null|callable the application's say over which URLs may be targets */
+	private static $_urlValidator;
 
 	/** @var string where the delivery is posted */
 	private string $_url = '';
@@ -100,13 +129,17 @@ class TWebhookTarget extends TApplicationComponent
 	 * Turns one item of an application's webhook list into a target.
 	 * @param mixed $spec a target, a URL, or an array of properties, in which `secret` is
 	 *   shorthand for an HMAC signature keyed with it.
-	 * @throws \Prado\Exceptions\TConfigurationException when $spec is none of those, or
-	 *   names no usable URL.
+	 * @throws \Prado\Exceptions\TConfigurationException when $spec is none of those, names no
+	 *   usable URL -- a built target included -- or names a property this class does not have.
 	 * @return self the target $spec describes.
 	 */
 	public static function ensure(mixed $spec): self
 	{
 		if ($spec instanceof self) {
+			if ($spec->getUrl() === '') {
+				throw new TConfigurationException('webhooks_target_url_required', $spec::class);
+			}
+
 			return $spec;
 		}
 
@@ -125,7 +158,13 @@ class TWebhookTarget extends TApplicationComponent
 				$signature->setSecret($value);
 				$target->setSignature($signature);
 			} else {
-				$target->setSubproperty((string) $name, $value);
+				try {
+					$target->setSubproperty((string) $name, $value);
+				} catch (TInvalidOperationException $e) {
+					// TComponent's own message names a class and a property; a subscription row
+					// with a misspelled key deserves one that says what the keys are.
+					throw new TConfigurationException('webhooks_target_property_unknown', (string) $name, static::class);
+				}
 			}
 		}
 		if ($target->getUrl() === '') {
@@ -199,8 +238,19 @@ class TWebhookTarget extends TApplicationComponent
 			$headers[$this->_deliveryHeader] = $deliveryId;
 		}
 
-		// The target's own headers win, so an application can override anything above.
-		return array_merge($headers, $this->_headers);
+		// The target's own headers win, so an application can override anything above --
+		// however it spells the name. Header names are case-insensitive, and a target's
+		// `content-type` alongside the default `Content-Type` would send both.
+		foreach ($this->_headers as $name => $value) {
+			foreach (array_keys($headers) as $existing) {
+				if (strcasecmp((string) $existing, (string) $name) === 0) {
+					unset($headers[$existing]);
+				}
+			}
+			$headers[$name] = $value;
+		}
+
+		return $headers;
 	}
 
 	/**
@@ -213,9 +263,10 @@ class TWebhookTarget extends TApplicationComponent
 
 	/**
 	 * @param mixed $value an absolute `http` or `https` URL.
-	 * @throws \Prado\Exceptions\TConfigurationException when $value is not one. A relative
-	 *   URL, or a scheme this package cannot post to, is a configuration mistake rather
-	 *   than a delivery that should be attempted and fail.
+	 * @throws \Prado\Exceptions\TConfigurationException when $value is not one, or the
+	 *   {@see setUrlValidator UrlValidator} refuses it. A relative URL, or a scheme this
+	 *   package cannot post to, is a configuration mistake rather than a delivery that
+	 *   should be attempted and fail.
 	 */
 	public function setUrl($value): void
 	{
@@ -224,7 +275,38 @@ class TWebhookTarget extends TApplicationComponent
 		if (parse_url($url, PHP_URL_HOST) === null || !in_array($scheme, ['http', 'https'], true)) {
 			throw new TConfigurationException('webhooks_target_url_invalid', $url);
 		}
+		if (self::$_urlValidator !== null && !(self::$_urlValidator)($url)) {
+			throw new TConfigurationException('webhooks_target_url_refused', $url);
+		}
 		$this->_url = $url;
+	}
+
+	/**
+	 * @return null|callable the application's say over which URLs may be targets, or null
+	 *   when any absolute `http` or `https` URL may.
+	 * @since 0.2.0
+	 */
+	public static function getUrlValidator(): ?callable
+	{
+		return self::$_urlValidator;
+	}
+
+	/**
+	 * Installs a check every target URL has to pass, for the whole process.
+	 *
+	 * It is given the URL as a string, after it has been found to be an absolute `http` or
+	 * `https` URL, and returns whether the target may be built; false makes {@see setUrl}
+	 * throw. The class docblock has one that refuses private and link-local addresses.
+	 * There is one for all targets rather than one per target because the point is that a
+	 * subscriber cannot choose to be exempt.
+	 *
+	 * @param null|callable $validator the check, taking the URL and returning bool, or null
+	 *   to accept any absolute `http` or `https` URL again.
+	 * @since 0.2.0
+	 */
+	public static function setUrlValidator(?callable $validator): void
+	{
+		self::$_urlValidator = $validator;
 	}
 
 	/**
@@ -243,7 +325,7 @@ class TWebhookTarget extends TApplicationComponent
 	{
 		$method = strtoupper(trim(TPropertyValue::ensureString($value)));
 		if ($method === '') {
-			throw new TConfigurationException('webhooks_methods_required', static::class);
+			throw new TConfigurationException('webhooks_target_method_required', static::class);
 		}
 		$this->_method = $method;
 	}

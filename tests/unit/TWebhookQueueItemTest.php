@@ -109,4 +109,60 @@ class TWebhookQueueItemTest extends PHPUnit\Framework\TestCase
 		$this->assertSame(TWebhookQueueStatus::Delivered, TWebhookQueueStatus::ensure(' DELIVERED '));
 		$this->assertSame(TWebhookQueueStatus::Pending, TWebhookQueueStatus::ensure(TWebhookQueueStatus::Pending));
 	}
+
+	public function testAnOverLongStatusIsTrimmedWithAsciiDots()
+	{
+		// A UTF-8 ellipsis cannot be stored by a latin1 MySQL table, and the write recording
+		// a failure would fail for the mark that says it was shortened.
+		$item = new TWebhookQueueItem('https://example.com/hook');
+		$item->setLastStatus(str_repeat('x', 500));
+
+		$status = (string) $item->getLastStatus();
+		$this->assertSame(TWebhookQueueItem::MAX_LAST_STATUS_LENGTH, strlen($status));
+		$this->assertStringEndsWith('...', $status);
+		$this->assertMatchesRegularExpression('/^[\x20-\x7e]+$/', $status, 'ASCII only');
+
+		$item->setLastStatus(str_repeat('y', TWebhookQueueItem::MAX_LAST_STATUS_LENGTH));
+		$this->assertSame(str_repeat('y', TWebhookQueueItem::MAX_LAST_STATUS_LENGTH), $item->getLastStatus(), 'exactly the width is not trimmed');
+	}
+
+	public function testADeliveryIdWiderThanItsColumnIsRefused()
+	{
+		$item = new TWebhookQueueItem('https://example.com/hook');
+		$item->setDeliveryId(str_repeat('a', TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH));
+		$this->assertSame(TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH, strlen($item->getDeliveryId()));
+
+		try {
+			$item->setDeliveryId(str_repeat('a', TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH + 1));
+			$this->fail('an over-long delivery id should be refused, not truncated into an id nothing else has');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertStringContainsString('DeliveryId', $e->getMessage());
+			$this->assertStringContainsString((string) TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH, $e->getMessage());
+		}
+		$this->assertSame(TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH, strlen($item->getDeliveryId()), 'unchanged');
+	}
+
+	public function testAnEventWiderThanItsColumnIsRefused()
+	{
+		$item = new TWebhookQueueItem('https://example.com/hook');
+		$item->setEvent(str_repeat('e', TWebhookQueueItem::MAX_EVENT_LENGTH));
+		$this->assertSame(TWebhookQueueItem::MAX_EVENT_LENGTH, strlen((string) $item->getEvent()));
+
+		$this->expectException(TInvalidDataValueException::class);
+		$this->expectExceptionMessage('Event');
+		$item->setEvent(str_repeat('e', TWebhookQueueItem::MAX_EVENT_LENGTH + 1));
+	}
+
+	public function testTheConstructorEnforcesTheSameLimits()
+	{
+		try {
+			new TWebhookQueueItem('https://example.com/hook', null, str_repeat('e', TWebhookQueueItem::MAX_EVENT_LENGTH + 1));
+			$this->fail('an over-long event should be refused at construction');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertStringContainsString('Event', $e->getMessage());
+		}
+
+		$this->expectException(TInvalidDataValueException::class);
+		new TWebhookQueueItem('https://example.com/hook', null, null, str_repeat('d', TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH + 1));
+	}
 }

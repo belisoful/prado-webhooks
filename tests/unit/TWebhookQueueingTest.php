@@ -2,6 +2,7 @@
 
 use Belisoful\Prado\Web\Webhooks\IWebhookQueue;
 use Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature;
+use Belisoful\Prado\Web\Webhooks\TDbWebhookQueue;
 use Belisoful\Prado\Web\Webhooks\TWebhookCronTask;
 use Belisoful\Prado\Web\Webhooks\TWebhookDelivery;
 use Belisoful\Prado\Web\Webhooks\TWebhookModule;
@@ -11,9 +12,11 @@ use Belisoful\Prado\Web\Webhooks\TWebhookQueueStatus;
 use Belisoful\Prado\Web\Webhooks\TWebhookSender;
 use Belisoful\Prado\Web\Webhooks\TWebhookTarget;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
 use Prado\IO\HttpClient\THttpClientResponse;
+use Prado\TApplicationMode;
 
 /**
  * A queue in memory. It proves the contract is implementable by something that is not a
@@ -240,6 +243,75 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$this->assertSame('s3cret', $items[0]->getTargetSpec()['secret']);
 	}
 
+	public function testABadTargetAnywhereInTheListQueuesNothing()
+	{
+		// Built one at a time, a bad third specification threw after the first two were
+		// already in the table -- half a fan-out, with nothing telling the caller which half.
+		try {
+			$this->_module->queue([self::URL, 'https://other.example/hook', 42], ['id' => 1]);
+			$this->fail('a bad specification should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertSame(0, $this->_queue->getCount(), 'nothing was queued');
+		}
+	}
+
+	public function testAnObjectInTheThirdSpecificationQueuesNothingEither()
+	{
+		try {
+			$this->_module->queue([
+				self::URL,
+				'https://other.example/hook',
+				['url' => 'https://third.example/hook', 'data' => new THmacWebhookSignature()],
+			], ['id' => 1]);
+			$this->fail('an object in a specification should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertSame(0, $this->_queue->getCount());
+		}
+	}
+
+	public function testAPayloadThatCannotBeWrittenDownIsRefusedBeforeAnythingIsQueued()
+	{
+		// TDbWebhookQueue used to store a failed json_encode as '', and the row would then
+		// fail every attempt for a reason the code that queued it never saw.
+		try {
+			$this->_module->queue([self::URL, 'https://other.example/hook'], ['bad' => fopen('php://memory', 'r')]);
+			$this->fail('a resource cannot be written down');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertSame(0, $this->_queue->getCount());
+		}
+	}
+
+	public function testAStringPayloadThatIsNotValidUtf8IsRefused()
+	{
+		// json_encode refuses it, so the queue could not have stored it either.
+		$this->expectException(TInvalidDataValueException::class);
+		$this->_module->queue(self::URL, "\xB1\x31");
+	}
+
+	public function testAScalarPayloadForAFormTargetIsRefusedAsTheSenderWould()
+	{
+		try {
+			$this->_module->queue([['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']], 42);
+			$this->fail('a form needs fields');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertSame(0, $this->_queue->getCount());
+		}
+
+		$items = $this->_module->queue([['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']], ['id' => 42]);
+		$this->assertCount(1, $items, 'an array is a form');
+		$this->assertCount(1, $this->_module->queue(self::URL, 42), 'and a scalar is fine as JSON');
+	}
+
+	public function testAnEventWiderThanItsColumnQueuesNothing()
+	{
+		try {
+			$this->_module->queue([self::URL, 'https://other.example/hook'], ['id' => 1], str_repeat('e', 191));
+			$this->fail('an over-long event should be refused');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertSame(0, $this->_queue->getCount());
+		}
+	}
+
 	public function testQueueingWithoutAQueueSaysSo()
 	{
 		$module = new TWebhookModule();
@@ -461,6 +533,143 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$this->assertStringContainsString('Secret', (string) $this->_queue->rescheduled[0][0]->getLastStatus());
 	}
 
+	public function testAThrowingDeliveredHandlerDoesNotTurnAnAcceptedDeliveryIntoARetry()
+	{
+		// The request had been made and answered by the time the handler ran, so the answer
+		// stands. Treated as a failed attempt, the delivery was rescheduled and sent again.
+		$this->answer(new THttpClientResponse(200));
+		$this->_module->getSender()->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+		$item = $this->_module->queue(self::URL, ['id' => 1])[0];
+
+		$deliveries = $this->_module->drain();
+
+		$this->assertCount(1, $deliveries);
+		$this->assertTrue($deliveries[0]->getSuccessful());
+		$this->assertSame('the handler broke', $deliveries[0]->getHandlerError());
+		$this->assertCount(1, $this->_queue->succeeded, 'recorded as delivered');
+		$this->assertSame([], $this->_queue->rescheduled, 'not rescheduled');
+		$this->assertSame(1, $item->getAttempts());
+		$this->assertStringContainsString('the handler broke', (string) $item->getLastStatus());
+		$this->assertStringStartsWith('HTTP 200', (string) $item->getLastStatus());
+		$this->assertFalse($this->_module->getSender()->getContainHandlerErrors(), 'restored after the run');
+	}
+
+	public function testAThrowingFailedHandlerCostsOneAttemptNotTwo()
+	{
+		$this->answer(new THttpClientResponse(503));
+		$this->_module->getSender()->onFailed[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+		$item = $this->_module->queue(self::URL, ['id' => 1])[0];
+
+		$this->_module->drain();
+
+		$this->assertSame(1, $item->getAttempts());
+		$this->assertCount(1, $this->_queue->rescheduled);
+	}
+
+	public function testDrainRestoresTheSendersContainmentSettingWhateverItWas()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$sender = $this->_module->getSender();
+		$sender->setContainHandlerErrors(true);
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertTrue($sender->getContainHandlerErrors(), 'it was on before, so it stays on');
+	}
+
+	public function testAWriteBackThatFailsDoesNotCountTheAttemptTwice()
+	{
+		// attempts was incremented once when the delivery ran, and again in the catch when
+		// the write-back threw, so a row whose first record failed had used two attempts.
+		$queue = new class () extends TestArrayWebhookQueue {
+			public int $refusals = 1;
+
+			public function succeed(TWebhookQueueItem $item): void
+			{
+				if ($this->refusals-- > 0) {
+					throw new RuntimeException('the database blinked');
+				}
+				parent::succeed($item);
+			}
+		};
+		$this->_module->setQueue($queue);
+		$this->answer(new THttpClientResponse(200));
+		$item = $this->_module->queue(self::URL, ['id' => 1])[0];
+
+		$deliveries = $this->_module->drain();
+
+		$this->assertCount(1, $deliveries);
+		$this->assertSame(1, $item->getAttempts(), 'one attempt was made, so one is counted');
+		$this->assertCount(1, $queue->rescheduled, 'put back to be tried again');
+		$this->assertSame('the database blinked', $item->getLastStatus());
+	}
+
+	public function testARetryAfterOnTheResponseSetsTheQueuesDelay()
+	{
+		// A receiver answering 429 with a Retry-After has said exactly when trying again
+		// stops being a waste; the backoff was only guessing.
+		$this->answer(new THttpClientResponse(429, ['Retry-After' => '120'], ''));
+		$this->_module->setQueueRetryDelay(60);
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertSame(120, end($this->_queue->rescheduled)[1]);
+	}
+
+	public function testARetryAfterIsCappedAtTheQueuesCeilingNotTheSenders()
+	{
+		$this->answer(new THttpClientResponse(503, ['Retry-After' => '99999'], ''));
+		$this->_module->setQueueMaxRetryDelay(3600);
+		$this->_module->getSender()->setMaxRetryDelay(1000);
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertSame(3600, end($this->_queue->rescheduled)[1]);
+	}
+
+	public function testAnHttpDateRetryAfterIsHonoredByTheQueue()
+	{
+		$this->answer(new THttpClientResponse(503, ['Retry-After' => gmdate('D, d M Y H:i:s', time() + 600) . ' GMT'], ''));
+		$this->_module->setQueueRetryDelay(60);
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$delay = end($this->_queue->rescheduled)[1];
+		$this->assertGreaterThanOrEqual(599, $delay);
+		$this->assertLessThanOrEqual(600, $delay);
+	}
+
+	public function testWithoutARetryAfterTheBackoffStillApplies()
+	{
+		$this->answer(new THttpClientResponse(429));
+		$this->_module->setQueueRetryDelay(60);
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertSame(60, end($this->_queue->rescheduled)[1]);
+	}
+
+	public function testARetryAfterDoesNotGrantAnExtraAttempt()
+	{
+		$this->answer(new THttpClientResponse(429, ['Retry-After' => '5'], ''));
+		$this->_module->setQueueMaxAttempts(1);
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertCount(1, $this->_queue->abandoned);
+		$this->assertSame([], $this->_queue->rescheduled);
+	}
+
 	public function testDrainingTakesNoMoreThanItIsAskedFor()
 	{
 		$this->answer(new THttpClientResponse(200));
@@ -539,12 +748,146 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$this->assertSame(0, $task->execute(null), 'the in-memory queue prunes nothing');
 	}
 
-	public function testATaskFindsTheModuleByItsDefaultId()
+	public function testThePruneTaskBatchSizeRoundTripsAndDefaultsToUnbounded()
+	{
+		$task = new TWebhookPruneCronTask();
+		$this->assertSame(0, $task->getBatchSize());
+
+		$task->setBatchSize(250);
+		$this->assertSame(250, $task->getBatchSize());
+		$task->setBatchSize(-5);
+		$this->assertSame(0, $task->getBatchSize(), 'below one is unbounded');
+	}
+
+	public function testThePruneTaskPassesItsBatchSizeToADatabaseQueue()
+	{
+		$queue = new class () extends TDbWebhookQueue {
+			public array $calls = [];
+
+			public function prune(int $age, int $limit = 0): int
+			{
+				$this->calls[] = [$age, $limit];
+
+				return 0;
+			}
+		};
+		$this->_module->setQueue($queue);
+		$task = new class ($this->_module) extends TWebhookPruneCronTask {
+			public function __construct(private TWebhookModule $_webhooks)
+			{
+				parent::__construct();
+			}
+
+			public function getWebhookModule(): TWebhookModule
+			{
+				return $this->_webhooks;
+			}
+		};
+		$task->setMaxAge(3600);
+
+		$task->execute(null);
+		$task->setBatchSize(100);
+		$task->execute(null);
+
+		$this->assertSame([[3600, 0], [3600, 100]], $queue->calls);
+	}
+
+	public function testThePruneTaskBatchSizeIsIgnoredByAQueueThatTakesNone()
+	{
+		// The contract has no limit on prune(); another implementation removes everything old
+		// enough as it always did, rather than being handed an argument it did not declare.
+		$queue = new class () extends TestArrayWebhookQueue {
+			public array $calls = [];
+
+			public function prune(int $age): int
+			{
+				$this->calls[] = func_get_args();
+
+				return 0;
+			}
+		};
+		$this->_module->setQueue($queue);
+		$task = new class ($this->_module) extends TWebhookPruneCronTask {
+			public function __construct(private TWebhookModule $_webhooks)
+			{
+				parent::__construct();
+			}
+
+			public function getWebhookModule(): TWebhookModule
+			{
+				return $this->_webhooks;
+			}
+		};
+		$task->setBatchSize(100);
+
+		$task->execute(null);
+
+		$this->assertSame([[TWebhookPruneCronTask::DEFAULT_MAX_AGE]], $queue->calls);
+	}
+
+	public function testATaskFindsTheModuleByItsDefaultIdWithoutWritingItDown()
+	{
+		// Resolving the module is a read. A getter that wrote the default into ModuleId as a
+		// side effect had a task persisted by the cron module come back configured
+		// differently from how it was written.
+		$module = $this->_module;
+		$application = new class ($module) {
+			public array $asked = [];
+
+			public function __construct(private TWebhookModule $_webhooks)
+			{
+			}
+
+			public function getModule($id)
+			{
+				$this->asked[] = $id;
+
+				return $this->_webhooks;
+			}
+
+			// TComponent asks these of the application while unlistening from global events.
+			public function getRuntimePath()
+			{
+				return sys_get_temp_dir();
+			}
+
+			public function getMode()
+			{
+				return TApplicationMode::Debug;
+			}
+		};
+		$task = new class ($application) extends TWebhookCronTask {
+			private ?object $_application = null;
+
+			public function __construct(object $application)
+			{
+				// Attached after construction: TComponent asks the application for its
+				// runtime path while it is being built, and the stub has none to give.
+				parent::__construct();
+				$this->_application = $application;
+			}
+
+			public function getApplication()
+			{
+				return $this->_application;
+			}
+
+			public function getModule()
+			{
+				throw new LogicException('getModule() reads ModuleId, which is null; the default is applied to the lookup instead');
+			}
+		};
+
+		$this->assertNull($task->getModuleId());
+		$this->assertSame($module, $task->getWebhookModule());
+		$this->assertSame([TWebhookModule::DEFAULT_MODULE_ID], $application->asked, 'it looks for the package id');
+		$this->assertNull($task->getModuleId(), 'and leaves the configuration as it was');
+	}
+
+	public function testATaskWithAnExplicitIdResolvesThroughGetModule()
 	{
 		$module = $this->_module;
 		$task = new class ($module) extends TWebhookCronTask {
-			public mixed $resolved = null;
-
 			public function __construct(private TWebhookModule $_webhooks)
 			{
 				parent::__construct();
@@ -552,14 +895,30 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 
 			public function getModule()
 			{
-				$this->resolved = $this->getModuleId();
-
 				return $this->_webhooks;
 			}
 		};
+		$task->setModuleId('my-webhooks');
 
 		$this->assertSame($module, $task->getWebhookModule());
-		$this->assertSame(TWebhookModule::DEFAULT_MODULE_ID, $task->resolved, 'it looks for the package id');
+		$this->assertSame('my-webhooks', $task->getModuleId());
+	}
+
+	public function testATaskWithNoIdAndNoApplicationSaysWhichIdItLookedFor()
+	{
+		$task = new class () extends TWebhookCronTask {
+			public function getApplication()
+			{
+				return null;
+			}
+		};
+
+		try {
+			$task->getWebhookModule();
+			$this->fail('there is no module to find');
+		} catch (TConfigurationException $e) {
+			$this->assertStringContainsString(TWebhookModule::DEFAULT_MODULE_ID, $e->getMessage());
+		}
 	}
 
 	public function testATaskPointedAtSomethingElseSaysSo()

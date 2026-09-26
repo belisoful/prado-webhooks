@@ -26,18 +26,27 @@ trait TWebhookTaskTrait
 	/**
 	 * Returns the module named by `ModuleId`, defaulting to the package's own id so a task
 	 * configured with nothing but a schedule still finds it.
+	 *
+	 * The default is applied to the lookup, not written to `ModuleId`: resolving a module is
+	 * a read, and a getter that changes the task's configuration as a side effect would have
+	 * a task persisted by the cron module come back different from how it was configured.
+	 *
 	 * @throws \Prado\Exceptions\TConfigurationException when the id names something that is
 	 *   not a {@see \Belisoful\Prado\Web\Webhooks\TWebhookModule}.
 	 * @return \Belisoful\Prado\Web\Webhooks\TWebhookModule the module.
 	 */
 	public function getWebhookModule(): TWebhookModule
 	{
-		if ($this->getModuleId() === null) {
-			$this->setModuleId(TWebhookModule::DEFAULT_MODULE_ID);
-		}
-		$module = $this->getModule();
+		$id = $this->getModuleId();
+		$module = $id === null
+			? $this->getApplication()?->getModule(TWebhookModule::DEFAULT_MODULE_ID)
+			: $this->getModule();
 		if (!($module instanceof TWebhookModule)) {
-			throw new TConfigurationException('webhooks_task_module_invalid', (string) $this->getModuleId(), static::class);
+			throw new TConfigurationException(
+				'webhooks_task_module_invalid',
+				(string) ($id ?? TWebhookModule::DEFAULT_MODULE_ID),
+				static::class
+			);
 		}
 
 		return $module;

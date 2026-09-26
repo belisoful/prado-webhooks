@@ -13,7 +13,9 @@ namespace Belisoful\Prado\Web\Webhooks;
 use Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner;
 use Composer\InstalledVersions;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\TPropertyValue;
+use Prado\Web\TMediaType;
 use Prado\Util\TPluginModule;
 use Throwable;
 
@@ -216,6 +218,9 @@ class TWebhookModule extends TPluginModule
 	 *   cannot be built, or a target carries something that cannot be written down -- a signer,
 	 *   or any other object, at any depth of the specification. Queue the secret in the
 	 *   specification, or queue a reference and rebuild the target in an `onDequeue` handler.
+	 * @throws \Prado\Exceptions\TInvalidDataValueException when the payload cannot be written
+	 *   down, or cannot be encoded the way a target asks -- found now, not hours later when
+	 *   the drain tries to send it.
 	 * @return \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem[] what was queued.
 	 */
 	public function queue(mixed $targets, mixed $payload, ?string $event = null): array
@@ -225,6 +230,8 @@ class TWebhookModule extends TPluginModule
 			$targets = [$targets];
 		}
 
+		// Everything is built and checked before anything is stored, so a bad specification
+		// at position N is refused with nothing queued rather than after 1..N-1 were.
 		$items = [];
 		foreach ($targets as $spec) {
 			// Checked before the target is built: an object in the specification makes
@@ -235,13 +242,46 @@ class TWebhookModule extends TPluginModule
 			if (!$target->getEnabled() || !$target->acceptsEvent($event)) {
 				continue;
 			}
+			$this->assertEncodable($payload, $target);
 			$item = new TWebhookQueueItem($storable, $payload, $event);
 			$item->setMaxAttempts($target->getMaxAttempts());
-			$queue->enqueue($item);
 			$items[] = $item;
 		}
 
+		foreach ($items as $item) {
+			$queue->enqueue($item);
+		}
+
 		return $items;
+	}
+
+	/**
+	 * Refuses a payload that could not be sent to a target once it is read back.
+	 *
+	 * The same checks {@see TWebhookSender} makes when it encodes for the wire, made now:
+	 * a payload that will not encode as JSON cannot be written to the queue at all -- the
+	 * queue stores it as JSON whatever the target's content type -- and one that is not an
+	 * array or object cannot be sent as a form. Left until the drain, either is a row that
+	 * fails every attempt for a reason the code that queued it never saw.
+	 *
+	 * @param mixed $payload the payload as the application gave it.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookTarget $target the target it is for.
+	 * @throws \Prado\Exceptions\TInvalidDataValueException when it cannot be encoded.
+	 * @since 0.2.0
+	 */
+	protected function assertEncodable(mixed $payload, TWebhookTarget $target): void
+	{
+		if (json_encode($payload) === false) {
+			throw new TInvalidDataValueException('webhooks_payload_invalid', json_last_error_msg());
+		}
+		if (
+			!is_string($payload)
+			&& !is_array($payload)
+			&& !is_object($payload)
+			&& str_starts_with(strtolower($target->getContentType()), TMediaType::FORM)
+		) {
+			throw new TInvalidDataValueException('webhooks_payload_invalid', get_debug_type($payload));
+		}
 	}
 
 	/**
@@ -311,6 +351,13 @@ class TWebhookModule extends TPluginModule
 	 * because it is claimed again next time the queue never moves. Contained, it uses up its
 	 * attempts like anything else and settles as a failed row with the reason on it.
 	 *
+	 * What a handler does after the request is another matter. An `onDelivered` or `onFailed`
+	 * handler that throws has thrown after the receiver answered, so the answer stands: the
+	 * sender is asked to contain those for the length of the run, and the delivery is
+	 * recorded as it went, with the handler's exception on its
+	 * {@see TWebhookDelivery::getHandlerError HandlerError} and in the row's last status.
+	 * Treated as a failed attempt instead, an accepted delivery would be sent again.
+	 *
 	 * @param int $limit how many deliveries to take.
 	 * @param int $leaseSeconds how long to hold them for.
 	 * @throws \Prado\Exceptions\TConfigurationException when no queue is configured.
@@ -323,17 +370,39 @@ class TWebhookModule extends TPluginModule
 		$sender = $this->getSender();
 
 		$deliveries = [];
-		foreach ($queue->claim($limit, $leaseSeconds) as $item) {
-			try {
-				$deliveries[] = $delivery = $this->attempt($sender, $item);
+		$contained = $sender->getContainHandlerErrors();
+		$sender->setContainHandlerErrors(true);
+		try {
+			foreach ($queue->claim($limit, $leaseSeconds) as $item) {
+				try {
+					$delivery = $this->attempt($sender, $item);
+				} catch (Throwable $e) {
+					// Thrown before or while sending: the row could not be built, or the signer
+					// could not sign. That is an attempt spent.
+					$item->setAttempts($item->getAttempts() + 1);
+					$item->setLastStatus($e->getMessage());
+					$this->failAttempt($queue, $item);
+
+					continue;
+				}
+				$deliveries[] = $delivery;
 				$item->setAttempts($item->getAttempts() + $delivery->getAttempts());
-				$item->setLastStatus($delivery->getStatusText());
-				$this->recordAttempt($queue, $item, $delivery);
-			} catch (Throwable $e) {
-				$item->setAttempts($item->getAttempts() + 1);
-				$item->setLastStatus($e->getMessage());
-				$this->failAttempt($queue, $item);
+				$status = $delivery->getStatusText();
+				if ($delivery->getHandlerError() !== null) {
+					$status .= '; handler: ' . $delivery->getHandlerError();
+				}
+				$item->setLastStatus($status);
+				try {
+					$this->recordAttempt($queue, $item, $delivery);
+				} catch (Throwable $e) {
+					// The attempt was made and counted once; a write-back that fails does not
+					// make it a second one.
+					$item->setLastStatus($e->getMessage());
+					$this->failAttempt($queue, $item);
+				}
 			}
+		} finally {
+			$sender->setContainHandlerErrors($contained);
 		}
 
 		return $deliveries;
@@ -366,6 +435,12 @@ class TWebhookModule extends TPluginModule
 
 	/**
 	 * Writes back what one attempt did to a queued delivery.
+	 *
+	 * A failed attempt goes back with the computed backoff -- unless the receiver said when
+	 * to come back. A `Retry-After` on the response is honored in place of the backoff, up
+	 * to {@see getQueueMaxRetryDelay QueueMaxRetryDelay}: a receiver answering 429 with one
+	 * has said exactly when trying again stops being a waste.
+	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\IWebhookQueue $queue the queue it came from.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem $item the claimed delivery.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookDelivery $delivery what happened.
@@ -384,7 +459,31 @@ class TWebhookModule extends TPluginModule
 
 			return;
 		}
-		$this->failAttempt($queue, $item);
+		$retryAfter = $this->retryAfterFor($delivery);
+		if ($retryAfter === null) {
+			$this->failAttempt($queue, $item);
+
+			return;
+		}
+		$this->retryOrAbandon($queue, $item, min($retryAfter, $this->_queueMaxRetryDelay));
+	}
+
+	/**
+	 * Reads how long the receiver asked to be left alone for, when it said.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookDelivery $delivery what happened.
+	 * @return null|int the `Retry-After` of the last response in whole seconds, rounded up,
+	 *   or null when there was no response or it named none.
+	 * @since 0.2.0
+	 */
+	protected function retryAfterFor(TWebhookDelivery $delivery): ?int
+	{
+		$response = $delivery->getResponse();
+		if ($response === null) {
+			return null;
+		}
+		$milliseconds = $this->getSender()->parseRetryAfter($response);
+
+		return $milliseconds === null ? null : (int) ceil($milliseconds / 1000);
 	}
 
 	/**
@@ -395,12 +494,26 @@ class TWebhookModule extends TPluginModule
 	 */
 	protected function failAttempt(IWebhookQueue $queue, TWebhookQueueItem $item): void
 	{
+		$this->retryOrAbandon($queue, $item, $this->retryDelayFor($item->getAttempts()));
+	}
+
+	/**
+	 * Puts a delivery back to be tried again after a given delay, or gives up on it when it
+	 * has had every attempt it gets.
+	 * @param \Belisoful\Prado\Web\Webhooks\IWebhookQueue $queue the queue it came from.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem $item the claimed delivery,
+	 *   carrying its updated attempt count.
+	 * @param int $delaySeconds how long before it is due again.
+	 * @since 0.2.0
+	 */
+	protected function retryOrAbandon(IWebhookQueue $queue, TWebhookQueueItem $item, int $delaySeconds): void
+	{
 		if ($item->getAttempts() >= ($item->getMaxAttempts() ?: $this->_queueMaxAttempts)) {
 			$queue->abandon($item);
 
 			return;
 		}
-		$queue->reschedule($item, $this->retryDelayFor($item->getAttempts()));
+		$queue->reschedule($item, max(0, $delaySeconds));
 	}
 
 	/**

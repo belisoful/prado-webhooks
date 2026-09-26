@@ -6,6 +6,7 @@ use Belisoful\Prado\Web\Webhooks\TWebhookModule;
 use Belisoful\Prado\Web\Webhooks\TWebhookRequest;
 use Belisoful\Prado\Web\Webhooks\TWebhookSender;
 use Belisoful\Prado\Web\Webhooks\TWebhookTarget;
+use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
@@ -47,6 +48,12 @@ class TestWebhookSender extends TWebhookSender
 	protected function pause(int $milliseconds): void
 	{
 		$this->pauses[] = $milliseconds;
+	}
+
+	/** Exposes the backoff arithmetic, so the overflow case can be checked without 64 requests. */
+	public function backoffFor(int $delay, int $attempt): int
+	{
+		return $this->backoff($delay, $attempt);
 	}
 }
 
@@ -204,10 +211,56 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 		$this->assertSame([TWebhookSender::MAX_RETRY_AFTER], $this->_sender->pauses);
 	}
 
-	public function testAnHttpDateRetryAfterFallsBackToTheBackoff()
+	public function testAnHttpDateRetryAfterIsHonoredAsTheTimeUntilThen()
+	{
+		// RFC 9110 §10.2.3 allows a date as well as a number of seconds.
+		$this->answer(
+			new THttpClientResponse(503, ['Retry-After' => gmdate('D, d M Y H:i:s', time() + 5) . ' GMT'], ''),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(2);
+		$this->_sender->setRetryDelay(100);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertCount(1, $this->_sender->pauses);
+		// The second may have turned over between the header being written and read.
+		$this->assertGreaterThanOrEqual(3000, $this->_sender->pauses[0]);
+		$this->assertLessThanOrEqual(5000, $this->_sender->pauses[0]);
+	}
+
+	public function testAnHttpDateRetryAfterFarOutIsCapped()
 	{
 		$this->answer(
-			new THttpClientResponse(503, ['Retry-After' => 'Wed, 21 Oct 2026 07:28:00 GMT'], ''),
+			new THttpClientResponse(503, ['Retry-After' => 'Wed, 21 Oct 2099 07:28:00 GMT'], ''),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(2);
+		$this->_sender->setMaxRetryDelay(4000);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([4000], $this->_sender->pauses);
+	}
+
+	public function testAnHttpDateRetryAfterAlreadyPastMeansNow()
+	{
+		$this->answer(
+			new THttpClientResponse(503, ['Retry-After' => 'Wed, 21 Oct 2015 07:28:00 GMT'], ''),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(2);
+		$this->_sender->setRetryDelay(100);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([0], $this->_sender->pauses);
+	}
+
+	public function testAnUnreadableRetryAfterFallsBackToTheBackoff()
+	{
+		$this->answer(
+			new THttpClientResponse(503, ['Retry-After' => 'soon'], ''),
 			new THttpClientResponse(200)
 		);
 		$this->_sender->setMaxAttempts(2);
@@ -216,6 +269,180 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 		$this->_sender->send(self::URL, ['id' => 1]);
 
 		$this->assertSame([100], $this->_sender->pauses);
+	}
+
+	public function testANegativeRetryAfterIsNotANegativeWait()
+	{
+		// A negative wait handed to usleep is an error at best; it must clamp to nothing.
+		$this->answer(
+			new THttpClientResponse(429, ['Retry-After' => '-5'], ''),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(2);
+		$this->_sender->setRetryDelay(100);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([0], $this->_sender->pauses);
+	}
+
+	public function testParseRetryAfterReadsBothFormsAndCapsNothing()
+	{
+		$sender = new TWebhookSender();
+		$sender->setMaxRetryDelay(1000);
+
+		$this->assertSame(2000, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => '2'])));
+		$this->assertSame(1500, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => ' 1.5 '])));
+		$this->assertSame(0, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => '-1'])));
+		$this->assertSame(86400000, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => '86400'])), 'uncapped: the cap is the caller\'s');
+		$this->assertNull($sender->parseRetryAfter(new THttpClientResponse(429)));
+		$this->assertNull($sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => ''])));
+		$this->assertNull($sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => 'never'])));
+
+		$future = $sender->parseRetryAfter(
+			new THttpClientResponse(429, ['Retry-After' => gmdate('D, d M Y H:i:s', time() + 7200) . ' GMT'])
+		);
+		$this->assertGreaterThanOrEqual(7199000, $future);
+		$this->assertLessThanOrEqual(7200000, $future);
+		$this->assertSame(0, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => 'Thu, 01 Jan 2015 00:00:00 GMT'])));
+	}
+
+	public function testTheBackoffDoesNotOverflowAtHighAttemptCounts()
+	{
+		// 500 * 2 ** 63 is a float, and (int) of it is 0: the retry that should wait longest
+		// used to wait not at all.
+		$this->assertSame(TWebhookSender::MAX_RETRY_AFTER, $this->_sender->backoffFor(500, 64));
+		$this->assertSame(TWebhookSender::MAX_RETRY_AFTER, $this->_sender->backoffFor(500, 1000));
+		$this->assertSame(500, $this->_sender->backoffFor(500, 1));
+		$this->assertSame(400, $this->_sender->backoffFor(100, 3));
+		$this->assertSame(0, $this->_sender->backoffFor(0, 5), 'no delay stays no delay');
+		$this->assertSame(500, $this->_sender->backoffFor(500, 0), 'an attempt below one is treated as the first');
+	}
+
+	public function testSixtyFourAttemptsNeverWaitNothingAndNeverWaitPastTheCeiling()
+	{
+		$this->answer(new THttpClientResponse(500));
+		$this->_sender->setMaxAttempts(64);
+		$this->_sender->setRetryDelay(1000);
+		$this->_sender->setMaxRetryDelay(30000);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertCount(63, $this->_sender->pauses);
+		foreach ($this->_sender->pauses as $index => $pause) {
+			$this->assertGreaterThan(0, $pause, 'attempt ' . ($index + 1));
+			$this->assertLessThanOrEqual(30000, $pause, 'attempt ' . ($index + 1));
+		}
+		$this->assertSame([1000, 2000, 4000, 8000, 16000, 30000, 30000], array_slice($this->_sender->pauses, 0, 7));
+	}
+
+	public function testMaxRetryDelayCapsTheBackoffAndTheRetryAfterAlike()
+	{
+		$this->answer(
+			new THttpClientResponse(500),
+			new THttpClientResponse(503, ['Retry-After' => '30'], ''),
+			new THttpClientResponse(500),
+			new THttpClientResponse(200)
+		);
+		$this->_sender->setMaxAttempts(4);
+		$this->_sender->setRetryDelay(100);
+		$this->_sender->setMaxRetryDelay(250);
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([100, 250, 250], $this->_sender->pauses);
+	}
+
+	public function testMaxRetryDelayDefaultsAndIsAtLeastOne()
+	{
+		$sender = new TWebhookSender();
+		$this->assertSame(TWebhookSender::MAX_RETRY_AFTER, $sender->getMaxRetryDelay());
+
+		$sender->setMaxRetryDelay(0);
+		$this->assertSame(1, $sender->getMaxRetryDelay());
+		$sender->setMaxRetryDelay('2500');
+		$this->assertSame(2500, $sender->getMaxRetryDelay());
+	}
+
+	public function testABadTargetAnywhereInTheListStopsTheWholeSendBeforeAnyDelivery()
+	{
+		// Built lazily inside the loop, a bad third specification threw after the first two
+		// had been sent -- and their delivery records went with the exception.
+		$this->answer(new THttpClientResponse(200));
+
+		try {
+			$this->_sender->send([self::URL, 'https://other.example/hook', 42], ['id' => 1]);
+			$this->fail('a bad specification should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertSame([], $this->_client->requests, 'nothing was sent');
+		}
+	}
+
+	public function testASubstitutedClientCannotFollowRedirects()
+	{
+		// Following a 3xx posts the signed body somewhere the subscriber did not name, so the
+		// setting is forced off on every delivery rather than trusted on the client.
+		$this->_client->setFollowRedirects(true);
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertFalse($this->_client->getFollowRedirects());
+
+		$this->_client->setFollowRedirects(true);
+		$this->_sender->send(self::URL, ['id' => 1]);
+		$this->assertFalse($this->_client->getFollowRedirects(), 'and again on the next delivery');
+	}
+
+	public function testAThrowingDeliveredHandlerPropagatesFromAnInlineSend()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+
+		$this->assertFalse($this->_sender->getContainHandlerErrors());
+		$this->expectException(RuntimeException::class);
+		$this->_sender->send(self::URL, ['id' => 1]);
+	}
+
+	public function testAThrowingHandlerIsRecordedOnTheDeliveryWhenContained()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->setContainHandlerErrors(true);
+		$this->_sender->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertTrue($delivery->getSuccessful(), 'the receiver has it regardless');
+		$this->assertSame('the handler broke', $delivery->getHandlerError());
+	}
+
+	public function testAThrowingFailedHandlerIsContainedToo()
+	{
+		$this->answer(new THttpClientResponse(500));
+		$this->_sender->setMaxAttempts(1);
+		$this->_sender->setContainHandlerErrors(true);
+		$this->_sender->onFailed[] = function () {
+			throw new LogicException('failed handler broke');
+		};
+
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertFalse($delivery->getSuccessful());
+		$this->assertSame('failed handler broke', $delivery->getHandlerError());
+	}
+
+	public function testADeliveryWhoseHandlersReturnedHasNoHandlerError()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->setContainHandlerErrors(true);
+		$this->_sender->onDelivered[] = function () {
+		};
+
+		$this->assertNull($this->_sender->send(self::URL, ['id' => 1])[0]->getHandlerError());
 	}
 
 	public function testATransportFailureIsRetriedAndThenReported()

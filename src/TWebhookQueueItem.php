@@ -10,6 +10,7 @@
 
 namespace Belisoful\Prado\Web\Webhooks;
 
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\TEventParameter;
 use Prado\TPropertyValue;
 
@@ -44,6 +45,12 @@ class TWebhookQueueItem extends TEventParameter
 {
 	/** @var int the longest a recorded status may be, matching the column that holds it. */
 	public const MAX_LAST_STATUS_LENGTH = 190;
+
+	/** @var int the longest a delivery id may be, matching the column that holds it. */
+	public const MAX_DELIVERY_ID_LENGTH = 64;
+
+	/** @var int the longest an event name may be, matching the column that holds it. */
+	public const MAX_EVENT_LENGTH = 190;
 
 	/** @var null|string the lease this delivery was claimed under, if it was */
 	private ?string $_leaseToken = null;
@@ -94,8 +101,8 @@ class TWebhookQueueItem extends TEventParameter
 	public function __construct(array|string $targetSpec, mixed $payload = null, ?string $event = null, ?string $deliveryId = null)
 	{
 		$this->_targetSpec = $targetSpec;
-		$this->_event = $event;
-		$this->_deliveryId = $deliveryId ?? bin2hex(random_bytes(16));
+		$this->setEvent($event);
+		$this->setDeliveryId($deliveryId ?? bin2hex(random_bytes(16)));
 		$this->_createdTime = $this->_updatedTime = time();
 
 		parent::__construct($payload);
@@ -127,11 +134,19 @@ class TWebhookQueueItem extends TEventParameter
 	}
 
 	/**
-	 * @param mixed $value the id the receiver is shown.
+	 * @param mixed $value the id the receiver is shown, at most
+	 *   {@see MAX_DELIVERY_ID_LENGTH} characters.
+	 * @throws \Prado\Exceptions\TInvalidDataValueException when it is longer than the column
+	 *   that holds it. A server in strict mode would refuse the row; one that is not would
+	 *   truncate the id, and a receiver would then be shown an id nothing else has.
 	 */
 	public function setDeliveryId($value): void
 	{
-		$this->_deliveryId = TPropertyValue::ensureString($value);
+		$id = TPropertyValue::ensureString($value);
+		if (mb_strlen($id) > self::MAX_DELIVERY_ID_LENGTH) {
+			throw new TInvalidDataValueException('webhooks_queue_value_too_long', 'DeliveryId', self::MAX_DELIVERY_ID_LENGTH);
+		}
+		$this->_deliveryId = $id;
 	}
 
 	/**
@@ -143,11 +158,17 @@ class TWebhookQueueItem extends TEventParameter
 	}
 
 	/**
-	 * @param mixed $value the event name, or an empty value for none.
+	 * @param mixed $value the event name, at most {@see MAX_EVENT_LENGTH} characters, or an
+	 *   empty value for none.
+	 * @throws \Prado\Exceptions\TInvalidDataValueException when it is longer than the column
+	 *   that holds it.
 	 */
 	public function setEvent($value): void
 	{
 		$event = TPropertyValue::ensureString($value ?? '');
+		if (mb_strlen($event) > self::MAX_EVENT_LENGTH) {
+			throw new TInvalidDataValueException('webhooks_queue_value_too_long', 'Event', self::MAX_EVENT_LENGTH);
+		}
 		$this->_event = $event === '' ? null : $event;
 	}
 
@@ -292,7 +313,9 @@ class TWebhookQueueItem extends TEventParameter
 	 * Trimmed to {@see MAX_LAST_STATUS_LENGTH}, the width of the column that holds it. This
 	 * is where an exception message ends up, and those are long: a server in strict mode
 	 * rejects an over-long value rather than truncating it, which would mean the write
-	 * recording a failure failing in turn.
+	 * recording a failure failing in turn. The trim is marked with three ASCII dots rather
+	 * than an ellipsis character, because a table on a latin1 server cannot hold the latter,
+	 * and the write would fail for the mark that says it was shortened.
 	 *
 	 * @param mixed $value how the last attempt ended.
 	 */
@@ -300,7 +323,7 @@ class TWebhookQueueItem extends TEventParameter
 	{
 		$status = $value === null ? '' : TPropertyValue::ensureString($value);
 		if (mb_strlen($status) > self::MAX_LAST_STATUS_LENGTH) {
-			$status = mb_substr($status, 0, self::MAX_LAST_STATUS_LENGTH - 1) . '…';
+			$status = mb_substr($status, 0, self::MAX_LAST_STATUS_LENGTH - 3) . '...';
 		}
 		$this->_lastStatus = $status === '' ? null : $status;
 	}

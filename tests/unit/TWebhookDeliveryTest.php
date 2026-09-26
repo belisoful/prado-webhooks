@@ -115,4 +115,30 @@ class TWebhookDeliveryTest extends PHPUnit\Framework\TestCase
 
 		$this->assertNull($delivery->getEvent());
 	}
+
+	public function testAHandlerErrorIsNullUntilOneIsRecordedAndEmptyClearsIt()
+	{
+		$delivery = $this->delivery();
+		$this->assertNull($delivery->getHandlerError());
+
+		$delivery->setHandlerError('the handler broke');
+		$this->assertSame('the handler broke', $delivery->getHandlerError());
+
+		$delivery->setHandlerError('');
+		$this->assertNull($delivery->getHandlerError());
+
+		$delivery->setHandlerError('again');
+		$delivery->setHandlerError(null);
+		$this->assertNull($delivery->getHandlerError());
+	}
+
+	public function testAHandlerErrorDoesNotChangeWhetherTheDeliveryArrived()
+	{
+		$delivery = $this->delivery();
+		$delivery->setResponse(new THttpClientResponse(200));
+		$delivery->setHandlerError('the handler broke');
+
+		$this->assertTrue($delivery->getSuccessful());
+		$this->assertSame('HTTP 200', $delivery->getStatusText());
+	}
 }

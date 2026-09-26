@@ -9,6 +9,11 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 {
 	private const URL = 'https://example.com/hooks/prado';
 
+	protected function tearDown(): void
+	{
+		TWebhookTarget::setUrlValidator(null);
+	}
+
 	public function testATargetPassesThroughEnsureUnchanged()
 	{
 		$target = new TWebhookTarget();
@@ -228,5 +233,154 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 	{
 		$this->expectException(TConfigurationException::class);
 		TWebhookTarget::ensure(['url' => self::URL, 'method' => ' ']);
+	}
+
+	public function testABuiltTargetWithoutAUrlIsRefusedByEnsureToo()
+	{
+		// The object branch used to pass anything through; a target that was never given a
+		// URL would then reach the transport as a delivery to nowhere.
+		$this->expectException(TConfigurationException::class);
+		$this->expectExceptionMessage('Url');
+		TWebhookTarget::ensure(new TWebhookTarget());
+	}
+
+	public function testAnUnknownKeyIsAConfigurationMistakeThatNamesTheKey()
+	{
+		try {
+			TWebhookTarget::ensure(['url' => self::URL, 'ulr' => 'typo']);
+			$this->fail('an unknown key should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertStringContainsString("'ulr'", $e->getMessage());
+			$this->assertStringContainsString('secret', $e->getMessage(), 'the message says what the keys are');
+		}
+	}
+
+	public function testAnInvalidUrlIsStillReportedAsSuch()
+	{
+		// The unknown-key wrapping must not swallow the URL check's own message.
+		$this->expectException(TConfigurationException::class);
+		$this->expectExceptionMessage('http');
+		TWebhookTarget::ensure(['url' => 'not a url']);
+	}
+
+	public function testTheTargetsHeadersReplaceTheDefaultsWhateverTheirCase()
+	{
+		// Header names are case-insensitive; a target's `content-type` beside the default
+		// `Content-Type` sent both, and a receiver picked whichever it liked.
+		$target = TWebhookTarget::ensure([
+			'url' => self::URL,
+			'headers' => ['content-type' => 'application/vnd.example+json', 'x-webhook-event' => 'renamed'],
+		]);
+		$headers = $target->buildHeaders('invoice.paid', 'abc');
+
+		$this->assertSame('application/vnd.example+json', $headers['content-type']);
+		$this->assertArrayNotHasKey('Content-Type', $headers);
+		$this->assertSame('renamed', $headers['x-webhook-event']);
+		$this->assertArrayNotHasKey(TWebhookTarget::DEFAULT_EVENT_HEADER, $headers);
+		$this->assertCount(1, array_filter(array_keys($headers), static fn ($name) => strcasecmp($name, 'Content-Type') === 0));
+		$this->assertSame('abc', $headers[TWebhookTarget::DEFAULT_DELIVERY_HEADER], 'untouched headers stay');
+	}
+
+	public function testAUrlValidatorThatRefusesMakesTheTargetUnbuildable()
+	{
+		$seen = [];
+		TWebhookTarget::setUrlValidator(static function (string $url) use (&$seen): bool {
+			$seen[] = $url;
+
+			return false;
+		});
+
+		try {
+			TWebhookTarget::ensure(self::URL);
+			$this->fail('the validator refused, so the target should not be built');
+		} catch (TConfigurationException $e) {
+			$this->assertStringContainsString(self::URL, $e->getMessage());
+			$this->assertStringContainsString('refused', $e->getMessage());
+		}
+		$this->assertSame([self::URL], $seen, 'the validator saw the URL once');
+	}
+
+	public function testAUrlValidatorThatAcceptsLetsTheUrlBeSet()
+	{
+		TWebhookTarget::setUrlValidator(static fn (string $url): bool => true);
+
+		$this->assertSame(self::URL, TWebhookTarget::ensure(self::URL)->getUrl());
+		$this->assertSame(self::URL, TWebhookTarget::ensure(['url' => self::URL])->getUrl());
+	}
+
+	public function testTheValidatorIsNotAskedAboutAUrlThatIsAlreadyInvalid()
+	{
+		$asked = 0;
+		TWebhookTarget::setUrlValidator(static function () use (&$asked): bool {
+			$asked++;
+
+			return true;
+		});
+
+		try {
+			TWebhookTarget::ensure('ftp://example.com/hook');
+		} catch (TConfigurationException $e) {
+		}
+		$this->assertSame(0, $asked);
+	}
+
+	public function testNoValidatorChangesNothing()
+	{
+		$this->assertNull(TWebhookTarget::getUrlValidator());
+		$this->assertSame(self::URL, TWebhookTarget::ensure(self::URL)->getUrl());
+
+		$validator = static fn (string $url): bool => false;
+		TWebhookTarget::setUrlValidator($validator);
+		$this->assertSame($validator, TWebhookTarget::getUrlValidator());
+
+		TWebhookTarget::setUrlValidator(null);
+		$this->assertNull(TWebhookTarget::getUrlValidator());
+		$this->assertSame(self::URL, TWebhookTarget::ensure(self::URL)->getUrl(), 'accepted again');
+	}
+
+	public function testTheDocumentedValidatorRefusesPrivateAndLinkLocalAddresses()
+	{
+		// The example in the class docblock, run rather than trusted.
+		TWebhookTarget::setUrlValidator(static function (string $url): bool {
+			$host = trim((string) parse_url($url, PHP_URL_HOST), '[]');
+			if (filter_var($host, FILTER_VALIDATE_IP) === false) {
+				return true;
+			}
+
+			return filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+		});
+
+		foreach ([
+			'http://127.0.0.1/hook', 'http://127.255.0.9/hook',
+			'http://10.0.0.5/hook',
+			'http://172.16.0.1/hook', 'http://172.31.255.254/hook',
+			'http://192.168.1.1/hook',
+			'http://169.254.169.254/latest/meta-data/',
+			'http://[::1]/hook',
+			'http://[fc00::1]/hook', 'http://[fd12::1]/hook',
+			'http://[fe80::1]/hook',
+		] as $url) {
+			try {
+				TWebhookTarget::ensure($url);
+				$this->fail("{$url} should be refused");
+			} catch (TConfigurationException $e) {
+				$this->assertStringContainsString('refused', $e->getMessage(), $url);
+			}
+		}
+		// 2001:db8::/32 is not here: it is the documentation range, which PHP counts as reserved.
+		foreach (['http://93.184.216.34/hook', 'http://172.32.0.1/hook', 'http://[2606:4700::1111]/hook', 'https://example.com/hook'] as $url) {
+			$this->assertSame($url, TWebhookTarget::ensure($url)->getUrl());
+		}
+	}
+
+	public function testAnEmptyMethodSaysItIsTheMethodThatIsMissing()
+	{
+		try {
+			TWebhookTarget::ensure(['url' => self::URL, 'method' => '']);
+			$this->fail('an empty method should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertStringContainsString('Method', $e->getMessage());
+			$this->assertStringNotContainsString('at least one', $e->getMessage(), 'not the endpoint\'s message');
+		}
 	}
 }

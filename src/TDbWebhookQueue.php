@@ -15,6 +15,7 @@ use Prado\Data\TDataSourceConfig;
 use Prado\Data\TDbConnection;
 use Prado\Data\TDbDriver;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\TModule;
 use Prado\TPropertyValue;
 
@@ -46,9 +47,11 @@ use Prado\TPropertyValue;
  * A drain takes a lease rather than a lock: rows are stamped with a token and a time, and
  * only rows whose lease has run out can be stamped again. That is three statements -- find
  * the due ids, stamp them, read back what was actually stamped -- rather than one
- * `SELECT ... FOR UPDATE`, because the row-level locking syntaxes differ across the drivers
- * PRADO supports while this works the same on all of them. Two runners racing for the same
- * row both run the stamping `UPDATE`; its `WHERE` includes the lease, so exactly one wins.
+ * `SELECT ... FOR UPDATE`, because the row-level locking syntaxes differ across SQLite,
+ * MySQL and PostgreSQL while this works the same on all three. Two runners racing for the
+ * same row both run the stamping `UPDATE`; its `WHERE` repeats every condition the `SELECT`
+ * had -- the lease, and that the row is still due -- so exactly one wins, and a row that
+ * another runner rescheduled between the two statements is left for when it is due.
  *
  * A lease guards the claim; {@see ownedBy} guards the write-back. A runner that finishes
  * after its lease has expired finds its update matches nothing, so it cannot clear the lease
@@ -59,11 +62,19 @@ use Prado\TPropertyValue;
  * second runner sending the same delivery alongside it -- allowed by at-least-once, and
  * still worth avoiding.
  *
+ * Every time in the table -- when a delivery is due, when a lease runs out -- is written
+ * from the runner's own clock, not the server's. Runners on several application servers
+ * therefore need their clocks synchronized: one running a minute fast sees the others'
+ * leases expire a minute early, and starts their deliveries alongside them.
+ *
  * ## The table
  *
  * {@see setAutoCreateTable AutoCreateTable} creates it on first use, which suits
  * development. In production, create it once and leave the property off, so an application
- * that cannot see its table fails loudly instead of quietly making an empty one.
+ * that cannot see its table fails loudly instead of quietly making an empty one. The
+ * statements are written to the common ground of SQLite, MySQL and PostgreSQL, which are
+ * the three the test suite runs against; another server may well work, and has not been
+ * shown to.
  *
  * Accepted deliveries are removed unless {@see setKeepDelivered KeepDelivered} is on.
  * Deliveries that run out of attempts are kept either way, for inspection and replay, until
@@ -76,6 +87,9 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 {
 	/** @var string the table used when none is named. */
 	public const DEFAULT_TABLE_NAME = 'webhook_queue';
+
+	/** @var int how many rows one pass of a bounded {@see prune} removes at most. */
+	public const PRUNE_CHUNK_SIZE = 500;
 
 	/** @var null|\Prado\Data\TDbConnection the connection, once resolved */
 	private ?TDbConnection $_connection = null;
@@ -99,10 +113,21 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 * Stores a delivery to be attempted later.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem $item the delivery to store.
 	 * @throws \Prado\Exceptions\TConfigurationException when there is no usable table.
+	 * @throws \Prado\Exceptions\TInvalidDataValueException when the payload or the target
+	 *   specification cannot be written as JSON. Stored as an empty string instead, the row
+	 *   would come back as a delivery of nothing to nowhere and fail every attempt.
 	 */
 	public function enqueue(TWebhookQueueItem $item): void
 	{
 		$this->ensureTable();
+		$spec = json_encode($item->getTargetSpec());
+		if ($spec === false) {
+			throw new TInvalidDataValueException('webhooks_queue_spec_invalid', json_last_error_msg());
+		}
+		$payload = json_encode($item->getPayload());
+		if ($payload === false) {
+			throw new TInvalidDataValueException('webhooks_queue_payload_invalid', json_last_error_msg());
+		}
 		$now = time();
 		$item->setCreatedTime($now);
 		$item->setUpdatedTime($now);
@@ -115,8 +140,8 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 		);
 		$command->bindValue(':deliveryid', $item->getDeliveryId());
 		$command->bindValue(':eventname', $item->getEvent());
-		$command->bindValue(':targetspec', (string) json_encode($item->getTargetSpec()));
-		$command->bindValue(':payload', (string) json_encode($item->getPayload()));
+		$command->bindValue(':targetspec', $spec);
+		$command->bindValue(':payload', $payload);
 		$command->bindValue(':status', $item->getStatus()->value);
 		$command->bindValue(':attempts', $item->getAttempts());
 		$command->bindValue(':maxattempts', $item->getMaxAttempts());
@@ -145,11 +170,29 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 			return [];
 		}
 		$now = time();
-		$db = $this->getDbConnection();
+		$due = $this->findDue($limit, $now);
+		if ($due === []) {
+			return [];
+		}
 
+		$token = bin2hex(random_bytes(16));
+		$this->stampLease($due, $token, $now, $now + max(1, $leaseSeconds));
+
+		return $this->claimedBy($token);
+	}
+
+	/**
+	 * The first statement of a claim: which deliveries are due and unleased.
+	 * @param int $limit how many to find at most.
+	 * @param int $now the runner's clock.
+	 * @return int[] the ids, due first.
+	 * @since 0.2.0
+	 */
+	protected function findDue(int $limit, int $now): array
+	{
 		// Each placeholder is named once. PDO only allows a name to repeat while prepare
 		// emulation is on, which is a driver setting rather than something to rely on.
-		$command = $db->createCommand(
+		$command = $this->getDbConnection()->createCommand(
 			'SELECT tabuid FROM ' . $this->_tableName
 			. ' WHERE status = :status AND nextattempt <= :duenow AND leaseduntil <= :leasenow'
 			. ' ORDER BY nextattempt, tabuid LIMIT ' . $limit
@@ -157,28 +200,51 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 		$command->bindValue(':status', TWebhookQueueStatus::Pending->value);
 		$command->bindValue(':duenow', $now);
 		$command->bindValue(':leasenow', $now);
-		$due = $command->queryColumn();
-		if ($due === []) {
-			return [];
-		}
 
-		// The lease is in the WHERE, so of two runners stamping the same row exactly one
-		// writes it; the other's UPDATE matches nothing and it simply gets fewer rows back.
-		$token = bin2hex(random_bytes(16));
-		$until = $now + max(1, $leaseSeconds);
-		$command = $db->createCommand(
+		return array_map('intval', $command->queryColumn());
+	}
+
+	/**
+	 * The second statement of a claim: stamps the lease on the deliveries found, where they
+	 * still qualify.
+	 *
+	 * The `WHERE` repeats every condition {@see findDue} had rather than trusting it. The
+	 * lease, so that of two runners stamping the same row exactly one writes it and the
+	 * other simply gets fewer rows back. And that the row is still due: between the two
+	 * statements another runner may have attempted the delivery and rescheduled it with a
+	 * backoff, and stamping it anyway would send it again before that backoff had run.
+	 *
+	 * @param int[] $due the ids to stamp.
+	 * @param string $token the lease token.
+	 * @param int $now the runner's clock.
+	 * @param int $until when the lease runs out.
+	 * @since 0.2.0
+	 */
+	protected function stampLease(array $due, string $token, int $now, int $until): void
+	{
+		$command = $this->getDbConnection()->createCommand(
 			'UPDATE ' . $this->_tableName . ' SET leasetoken = :token, leaseduntil = :until, updatedtime = :now'
 			. ' WHERE tabuid IN (' . implode(', ', array_map('intval', $due)) . ')'
-			. ' AND status = :status AND leaseduntil <= :leasenow'
+			. ' AND status = :status AND nextattempt <= :duenow AND leaseduntil <= :leasenow'
 		);
 		$command->bindValue(':token', $token);
 		$command->bindValue(':until', $until);
 		$command->bindValue(':now', $now);
-		$command->bindValue(':leasenow', $now);
 		$command->bindValue(':status', TWebhookQueueStatus::Pending->value);
+		$command->bindValue(':duenow', $now);
+		$command->bindValue(':leasenow', $now);
 		$command->execute();
+	}
 
-		$command = $db->createCommand(
+	/**
+	 * The last statement of a claim: reads back what the stamp actually took.
+	 * @param string $token the lease token.
+	 * @return \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem[] the claimed deliveries, due first.
+	 * @since 0.2.0
+	 */
+	protected function claimedBy(string $token): array
+	{
+		$command = $this->getDbConnection()->createCommand(
 			'SELECT * FROM ' . $this->_tableName . ' WHERE leasetoken = :token ORDER BY nextattempt, tabuid'
 		);
 		$command->bindValue(':token', $token);
@@ -266,34 +332,80 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 
 	/**
 	 * Removes one delivery.
+	 *
+	 * A claimed delivery is removed while the caller still holds its lease, as every
+	 * write-back is. One that was never claimed has no lease to name, and is removed only
+	 * while nobody else holds one either: an application tidying up by id must not be able
+	 * to delete a row from under the runner that is sending it.
+	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem $item the delivery to remove.
 	 */
 	public function remove(TWebhookQueueItem $item): void
 	{
 		$this->ensureTable();
+		$where = $item->getLeaseToken() === null
+			? 'tabuid = :tabuid AND (leasetoken IS NULL OR leaseduntil <= :unleased)'
+			: $this->ownedBy($item);
 		$command = $this->getDbConnection()->createCommand(
-			'DELETE FROM ' . $this->_tableName . ' WHERE ' . $this->ownedBy($item)
+			'DELETE FROM ' . $this->_tableName . ' WHERE ' . $where
 		);
 		$this->bindOwnership($command, $item);
+		if ($item->getLeaseToken() === null) {
+			$command->bindValue(':unleased', time());
+		}
 		$command->execute();
 		$item->setLeaseToken(null);
 	}
 
 	/**
 	 * Removes finished deliveries older than a given age.
+	 *
+	 * Unbounded, this is one `DELETE`, which on a table that has not been pruned in a long
+	 * while is one long lock. Given a limit it works oldest first in chunks of
+	 * {@see PRUNE_CHUNK_SIZE}: the ids of a chunk, then a `DELETE` naming them, until the
+	 * limit is reached or a chunk comes back short -- written that way because neither
+	 * `DELETE ... LIMIT` nor `DELETE ... ORDER BY` is something all three servers accept.
+	 *
 	 * @param int $age how old, in seconds, a finished delivery must be.
+	 * @param int $limit how many to remove at most, or 0 for every one that qualifies.
 	 * @return int how many were removed.
 	 */
-	public function prune(int $age): int
+	public function prune(int $age, int $limit = 0): int
 	{
 		$this->ensureTable();
-		$command = $this->getDbConnection()->createCommand(
-			'DELETE FROM ' . $this->_tableName . ' WHERE status <> :pending AND updatedtime < :before'
-		);
-		$command->bindValue(':pending', TWebhookQueueStatus::Pending->value);
-		$command->bindValue(':before', time() - max(0, $age));
+		$before = time() - max(0, $age);
+		if ($limit < 1) {
+			$command = $this->getDbConnection()->createCommand(
+				'DELETE FROM ' . $this->_tableName . ' WHERE status <> :pending AND updatedtime < :before'
+			);
+			$command->bindValue(':pending', TWebhookQueueStatus::Pending->value);
+			$command->bindValue(':before', $before);
 
-		return $command->execute();
+			return $command->execute();
+		}
+
+		$removed = 0;
+		while ($removed < $limit) {
+			$chunk = min(self::PRUNE_CHUNK_SIZE, $limit - $removed);
+			$command = $this->getDbConnection()->createCommand(
+				'SELECT tabuid FROM ' . $this->_tableName . ' WHERE status <> :pending AND updatedtime < :before'
+				. ' ORDER BY updatedtime, tabuid LIMIT ' . $chunk
+			);
+			$command->bindValue(':pending', TWebhookQueueStatus::Pending->value);
+			$command->bindValue(':before', $before);
+			$ids = array_map('intval', $command->queryColumn());
+			if ($ids === []) {
+				break;
+			}
+			$removed += $this->getDbConnection()->createCommand(
+				'DELETE FROM ' . $this->_tableName . ' WHERE tabuid IN (' . implode(', ', $ids) . ')'
+			)->execute();
+			if (count($ids) < $chunk) {
+				break;
+			}
+		}
+
+		return $removed;
 	}
 
 	/**
@@ -399,16 +511,20 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	}
 
 	/**
-	 * Creates the queue table. Identifiers are unquoted and chosen to be reserved nowhere,
-	 * so one statement serves every driver PRADO speaks.
+	 * Creates the queue table. Identifiers are unquoted and chosen to be reserved on none of
+	 * SQLite, MySQL or PostgreSQL, so one statement serves all three but for the spelling of
+	 * the key -- and, on MySQL, the character set: a payload is JSON and may hold any
+	 * character, which a server defaulting to latin1 would refuse.
 	 */
 	protected function createTable(): void
 	{
 		$db = $this->getDbConnection();
 		$driver = $db->getDriverName();
 		$key = 'INTEGER PRIMARY KEY';
+		$options = '';
 		if ($driver === TDbDriver::DRIVER_MYSQL) {
 			$key = 'INTEGER PRIMARY KEY AUTO_INCREMENT';
+			$options = ' DEFAULT CHARSET=utf8mb4';
 		} elseif ($driver === TDbDriver::DRIVER_SQLITE) {
 			$key = 'INTEGER PRIMARY KEY AUTOINCREMENT';
 		} elseif ($driver === TDbDriver::DRIVER_PGSQL) {
@@ -431,7 +547,7 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 			laststatus VARCHAR(190) NULL,
 			createdtime INTEGER NOT NULL,
 			updatedtime INTEGER NOT NULL
-			)'
+			)' . $options
 		)->execute();
 
 		// The claim reads by the first three together, and the prune by status and age.

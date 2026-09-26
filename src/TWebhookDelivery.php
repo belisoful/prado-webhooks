@@ -69,6 +69,9 @@ class TWebhookDelivery extends TEventParameter
 	/** @var float how long every attempt took together, in seconds */
 	private float $_duration = 0.0;
 
+	/** @var null|string what a delivery event handler threw, when the sender was containing that */
+	private ?string $_handlerError = null;
+
 	/**
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookTarget $target where this is delivered.
 	 * @param string $id the delivery id, constant across retries.
@@ -267,5 +270,28 @@ class TWebhookDelivery extends TEventParameter
 	public function setDuration($value): void
 	{
 		$this->_duration = TPropertyValue::ensureFloat($value);
+	}
+
+	/**
+	 * @return null|string the message of the exception an `onDelivered` or `onFailed` handler
+	 *   threw, when the sender was asked to contain it (see
+	 *   {@see TWebhookSender::getContainHandlerErrors ContainHandlerErrors}), or null when
+	 *   every handler returned. It says nothing about whether the receiver has the delivery;
+	 *   {@see getSuccessful} does.
+	 * @since 0.2.0
+	 */
+	public function getHandlerError(): ?string
+	{
+		return $this->_handlerError;
+	}
+
+	/**
+	 * @param mixed $value what a handler threw, or null when none did.
+	 * @since 0.2.0
+	 */
+	public function setHandlerError($value): void
+	{
+		$error = $value === null ? '' : TPropertyValue::ensureString($value);
+		$this->_handlerError = $error === '' ? null : $error;
 	}
 }

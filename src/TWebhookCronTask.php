@@ -41,12 +41,14 @@ use Prado\Util\Cron\TCronTask;
  * doubling delay and is picked up by a later run, so `MaxAttempts` on the sender should
  * stay small -- an attempt here is already a retry.
  *
- * A run has to finish inside the schedule it is on, or runs overlap. The worst case is
- * `BatchSize` times the sender's `Timeout`, so a batch of 50 against a 10-second timeout is
- * potentially eight minutes of work on a once-a-minute schedule. Either keep the product
- * under the interval, or accept overlapping runs -- which is safe, because
- * {@see setLeaseSeconds LeaseSeconds} keeps two runs off the same delivery, but is only
- * safe while the lease outlasts an attempt.
+ * A run has to finish inside the schedule it is on, or runs overlap. The worst case is the
+ * sum of the timeouts of the deliveries in the batch -- each target's own `Timeout` where
+ * it has one, the sender's otherwise -- so a batch of 50 against a 10-second timeout is
+ * potentially eight minutes of work on a once-a-minute schedule, and longer where targets
+ * set more. Either keep that sum under the interval, or accept overlapping runs -- which is
+ * safe, because {@see setLeaseSeconds LeaseSeconds} keeps two runs off the same delivery,
+ * but is only safe while the lease outlasts the whole batch: the last delivery claimed is
+ * still leased while every one before it is sent.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0

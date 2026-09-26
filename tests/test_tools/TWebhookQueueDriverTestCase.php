@@ -13,6 +13,7 @@ use Belisoful\Prado\Web\Webhooks\TWebhookQueueItem;
 use Belisoful\Prado\Web\Webhooks\TWebhookQueueStatus;
 use Prado\Data\TDbConnection;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 
 /**
  * The queue's behaviour, against whichever database a subclass supplies.
@@ -412,7 +413,146 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 			'SELECT laststatus FROM ' . $this->_queue->getTableName()
 		)->queryScalar();
 		$this->assertLessThanOrEqual(TWebhookQueueItem::MAX_LAST_STATUS_LENGTH, mb_strlen($stored));
-		$this->assertStringEndsWith('…', $stored);
+		// ASCII dots, not an ellipsis character: a latin1 table cannot hold the latter.
+		$this->assertStringEndsWith('...', $stored);
+	}
+
+	public function testFourByteCharactersSurviveTheTable()
+	{
+		// A payload is JSON and may hold any character. On MySQL this is what the table's
+		// utf8mb4 charset is for: a server defaulting to latin1, or to the three-byte utf8,
+		// refuses or mangles an emoji.
+		$item = $this->item('https://example.com/hook', ['note' => 'paid 😀 ünïcödé']);
+		$this->_queue->enqueue($item);
+		$claimed = $this->_queue->claim(1, 600)[0];
+		$claimed->setAttempts(1);
+		$claimed->setLastStatus('failed 😀');
+		$this->_queue->reschedule($claimed, 0);
+
+		$again = $this->newQueue()->claim(1, 600)[0];
+		$this->assertSame(['note' => 'paid 😀 ünïcödé'], $again->getPayload());
+		$this->assertSame('failed 😀', $again->getLastStatus());
+	}
+
+	// ── Storing what cannot be written down ────────────────────────────────────
+
+	public function testAPayloadThatCannotBeEncodedIsRefusedRatherThanStoredAsNothing()
+	{
+		// json_encode of a resource is false, and (string) false is '': the row came back as
+		// a delivery of nothing and failed every attempt with no trace of why.
+		$item = $this->item('https://example.com/hook', ['bad' => fopen('php://memory', 'r')]);
+
+		try {
+			$this->_queue->enqueue($item);
+			$this->fail('an unencodable payload should be refused');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertNull($item->getId(), 'never stored');
+		}
+		$this->assertSame(0, $this->_queue->getCount());
+	}
+
+	public function testAPayloadThatIsNotValidUtf8IsRefused()
+	{
+		$this->expectException(TInvalidDataValueException::class);
+		$this->_queue->enqueue($this->item('https://example.com/hook', "\xB1\x31"));
+	}
+
+	public function testATargetSpecificationThatCannotBeEncodedIsRefused()
+	{
+		$item = new TWebhookQueueItem(['url' => 'https://example.com/hook', 'data' => "\xB1\x31"], ['id' => 1]);
+
+		try {
+			$this->_queue->enqueue($item);
+			$this->fail('an unencodable specification should be refused');
+		} catch (TInvalidDataValueException $e) {
+			$this->assertStringContainsString('target', $e->getMessage());
+		}
+		$this->assertSame(0, $this->_queue->getCount());
+	}
+
+	// ── The claim's two statements ─────────────────────────────────────────────
+
+	public function testARowRescheduledBetweenTheSelectAndTheUpdateIsNotClaimedBeforeItIsDue()
+	{
+		// claim() is three statements. The stamping UPDATE used to check the lease but not
+		// the due time, so a row another runner attempted and rescheduled in between -- its
+		// lease released, its next attempt an hour out -- was stamped and sent straight away.
+		$this->_queue->enqueue($this->item());
+		$other = $this->newQueue();
+
+		$racer = new class () extends TDbWebhookQueue {
+			public ?Closure $betweenStatements = null;
+
+			protected function stampLease(array $due, string $token, int $now, int $until): void
+			{
+				if ($this->betweenStatements !== null) {
+					$between = $this->betweenStatements;
+					$this->betweenStatements = null;
+					$between();
+				}
+				parent::stampLease($due, $token, $now, $until);
+			}
+		};
+		$racer->setDbConnection($this->_db);
+		$racer->betweenStatements = function () use ($other) {
+			$claimed = $other->claim(1, 600)[0];
+			$claimed->setAttempts(1);
+			$claimed->setLastStatus('HTTP 503');
+			$other->reschedule($claimed, 3600);
+		};
+
+		$this->assertSame([], $racer->claim(1, 600), 'the row is not due for an hour');
+		$this->assertNull($this->leaseTokenInTheTable(), 'and carries no lease');
+		$this->assertSame(1, $this->_queue->getCount(TWebhookQueueStatus::Pending));
+	}
+
+	public function testARowThatIsStillDueAfterTheSelectIsClaimedAsBefore()
+	{
+		// The extra condition must not refuse the ordinary case.
+		$this->_queue->enqueue($this->item());
+
+		$this->assertCount(1, $this->newQueue()->claim(1, 600));
+	}
+
+	// ── Removing by id ─────────────────────────────────────────────────────────
+
+	public function testRemovingByIdCannotDeleteARowAnotherRunnerIsSending()
+	{
+		// An application tidying up with the item it enqueued has no lease to name, and the
+		// delete by id alone went straight through the runner mid-attempt.
+		$item = $this->item();
+		$this->_queue->enqueue($item);
+		$held = $this->newQueue()->claim(1, 600)[0];
+
+		$this->_queue->remove($item);
+
+		$this->assertSame(1, $this->_queue->getCount(), 'the row is still there');
+		$this->assertSame($held->getLeaseToken(), $this->leaseTokenInTheTable());
+	}
+
+	public function testRemovingByIdWorksOnceTheLeaseHasRunOut()
+	{
+		$item = $this->item();
+		$this->_queue->enqueue($item);
+		$this->newQueue()->claim(1, 600);
+		$this->_db->createCommand(
+			'UPDATE ' . $this->_queue->getTableName() . ' SET leaseduntil = ' . (time() - 1)
+		)->execute();
+
+		$this->_queue->remove($item);
+
+		$this->assertSame(0, $this->_queue->getCount());
+	}
+
+	public function testTheLeaseHolderCanStillRemoveWhatItHolds()
+	{
+		$this->_queue->enqueue($this->item());
+		$held = $this->_queue->claim(1, 600)[0];
+
+		$this->_queue->remove($held);
+
+		$this->assertSame(0, $this->_queue->getCount());
+		$this->assertNull($held->getLeaseToken());
 	}
 
 	// ── Pruning ────────────────────────────────────────────────────────────────
@@ -433,6 +573,56 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 		$this->assertSame(1, $removed);
 		$this->assertSame(0, $this->_queue->getCount(TWebhookQueueStatus::Failed));
 		$this->assertSame(1, $this->_queue->getCount(TWebhookQueueStatus::Pending), 'age is not a reason to drop work');
+	}
+
+	public function testPruningCanBeBoundedAndTakesTheOldestFirst()
+	{
+		// One unbounded DELETE on a table that has never been pruned is one long lock.
+		$ages = [];
+		foreach ([5, 1, 4, 2, 3] as $order) {
+			$item = $this->item('https://example.com/failed' . $order);
+			$this->_queue->enqueue($item);
+			$this->_queue->abandon($item);
+			$this->age($item, 86400 * $order);
+			$ages[$item->getId()] = $order;
+		}
+		$young = $this->item('https://example.com/young');
+		$this->_queue->enqueue($young);
+		$this->_queue->abandon($young);
+
+		$this->assertSame(2, $this->_queue->prune(3600, 2));
+		$this->assertSame(4, $this->_queue->getCount());
+		$left = $this->_db->createCommand(
+			'SELECT tabuid FROM ' . $this->_queue->getTableName() . ' WHERE tabuid <> ' . (int) $young->getId()
+		)->queryColumn();
+		$this->assertSame([1, 2, 3], array_values(array_map(static fn ($id) => $ages[(int) $id], $left)), 'the two oldest went');
+
+		$this->assertSame(3, $this->_queue->prune(3600, 100), 'a bound above what qualifies removes what qualifies');
+		$this->assertSame(1, $this->_queue->getCount(), 'the young one stays');
+		$this->assertSame(0, $this->_queue->prune(3600, 100));
+	}
+
+	public function testABoundedPruneLeavesPendingDeliveriesAloneToo()
+	{
+		$pending = $this->item('https://example.com/pending');
+		$this->_queue->enqueue($pending);
+		$this->age($pending, 86400 * 365);
+
+		$this->assertSame(0, $this->_queue->prune(3600, 10));
+		$this->assertSame(1, $this->_queue->getCount(TWebhookQueueStatus::Pending));
+	}
+
+	public function testABoundOfZeroOrLessIsUnbounded()
+	{
+		for ($i = 0; $i < 3; $i++) {
+			$item = $this->item('https://example.com/failed' . $i);
+			$this->_queue->enqueue($item);
+			$this->_queue->abandon($item);
+			$this->age($item, 86400);
+		}
+
+		$this->assertSame(3, $this->_queue->prune(3600, 0));
+		$this->assertSame(0, $this->_queue->getCount());
 	}
 
 	public function testPruningLeavesFinishedDeliveriesThatAreStillYoung()

@@ -35,6 +35,10 @@ use Prado\Util\Cron\TCronTask;
  * Pending deliveries are never pruned, however old. A delivery still waiting is work the
  * application asked for, and age is not a reason to throw it away.
  *
+ * A table that has never been pruned may hold a great many finished rows, and removing them
+ * in one statement is one long lock. {@see setBatchSize BatchSize} bounds a run, when the
+ * queue is a {@see TDbWebhookQueue}; the rest waits for the next.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
  */
@@ -48,6 +52,9 @@ class TWebhookPruneCronTask extends TCronTask
 	/** @var int how old a finished delivery must be to be removed, in seconds */
 	private int $_maxAge = self::DEFAULT_MAX_AGE;
 
+	/** @var int how many deliveries one run removes at most; 0 for every one old enough */
+	private int $_batchSize = 0;
+
 	/**
 	 * Removes the finished deliveries that are old enough.
 	 * @param \Prado\Util\Cron\TCronModule $cronModule the module running this task.
@@ -56,7 +63,34 @@ class TWebhookPruneCronTask extends TCronTask
 	 */
 	public function execute($cronModule)
 	{
-		return $this->getWebhookModule()->getQueue()->prune($this->_maxAge);
+		$queue = $this->getWebhookModule()->getQueue();
+		if ($this->_batchSize > 0 && $queue instanceof TDbWebhookQueue) {
+			return $queue->prune($this->_maxAge, $this->_batchSize);
+		}
+
+		return $queue->prune($this->_maxAge);
+	}
+
+	/**
+	 * @return int how many deliveries one run removes at most, or 0 for every one that is
+	 *   old enough. Defaults to 0.
+	 * @since 0.2.0
+	 */
+	public function getBatchSize(): int
+	{
+		return $this->_batchSize;
+	}
+
+	/**
+	 * Bounds one run. Only a {@see TDbWebhookQueue} takes the bound -- the
+	 * {@see IWebhookQueue} contract has no limit on {@see IWebhookQueue::prune} -- and any
+	 * other queue removes everything old enough as before.
+	 * @param mixed $value the most one run removes; 0 or less for no bound.
+	 * @since 0.2.0
+	 */
+	public function setBatchSize($value): void
+	{
+		$this->_batchSize = max(0, TPropertyValue::ensureInteger($value));
 	}
 
 	/**
