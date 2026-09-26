@@ -51,7 +51,8 @@ public function init($config)
 		if ($service === null) {
 			return;
 		}
-		$service->onWebhook[] = [$this, 'anyWebhook'];   // every endpoint
+		$service->onWebhook[] = [$this, 'anyWebhook'];   // every endpoint's accepted deliveries
+		$service->onRefused[] = [$this, 'countRefusal']; // and the ones an endpoint turned away
 		if (($github = $service->getEndpoint('github')) !== null) {
 			$github->onWebhook[] = [$this, 'github'];
 		}
@@ -78,7 +79,16 @@ The endpoint refuses a delivery before any handler sees it when the method is no
 (405), the body is over `MaxBodySize` (413), the signature does not verify (401), or the
 body is not JSON and `RequireJson` is on (400). The checks run in that order, so an
 unauthenticated caller cannot make the endpoint hash a large body, and nothing reads the
-payload before the signature has been checked.
+payload before the signature has been checked — the body is not even decoded until then,
+and a request whose `Content-Length` already exceeds `MaxBodySize` is refused before it is
+read. A refused delivery reaches the service's `onRefused` event, never `onWebhook`, with
+its payload undecoded; a handler there may count or rate limit, and may swap the status for
+another refusal but not for a success.
+
+An endpoint with no `<signature>` child accepts everything, which is only right behind
+something that already authenticates the request. A misspelled child element is refused at
+boot rather than ignored, and `RequireVerifier="true"` makes a missing verifier a
+configuration error instead of an open door.
 
 Sending
 -------
@@ -120,7 +130,9 @@ that subscribe to other events, are skipped.
 **Retries.** A 2xx is delivered and a 4xx is refused — the receiver understood the request
 and will not like it better next time. Transport failures and the statuses in
 `RetryStatusCodes` (500, 502, 503, 504, plus 408, 425 and 429) are retried, with the delay doubling
-from `RetryDelay`, and a numeric `Retry-After` overriding it.
+from `RetryDelay` up to `MaxRetryDelay`, and a `Retry-After` — seconds or an HTTP date —
+overriding it, capped the same way. A queued delivery honors `Retry-After` too, capped at
+`QueueMaxRetryDelay`.
 
 **Deliveries are sent inside the request that triggered them**, so keep `Timeout` ×
 `MaxAttempts` to something a page can afford. `onSending`, `onDelivered` and `onFailed` are
@@ -205,9 +217,14 @@ $webhooks->onDequeue[] = function ($sender, TWebhookQueueItem $item) {
 Passing an already-built `TWebhookTarget` that carries a signature is refused rather than
 quietly queueing a delivery that would go out unsigned.
 
-Sizing: one run sends up to `BatchSize` deliveries and holds them for `LeaseSeconds`. Keep
-`BatchSize × Timeout` inside the cron interval, or accept overlapping runs — which is safe,
-but only while the lease outlasts a whole batch.
+Sizing: one run sends up to `BatchSize` deliveries and holds them for `LeaseSeconds`. The
+worst case of a run is the sum of the batch's timeouts — each target's own `Timeout` where
+it sets one, the sender's otherwise — so keep that inside the cron interval, or accept
+overlapping runs, which is safe only while the lease outlasts a whole batch. Handlers that
+throw during a run are recorded on the delivery rather than turning an accepted delivery
+into a retry. `TWebhookPruneCronTask` takes a `BatchSize` too, to bound one prune. Target
+URLs are the application's; `TWebhookTarget::setUrlValidator()` is where it refuses
+private or link-local ones before a subscriber-supplied URL reaches `send()` or `queue()`.
 
 Signature schemes
 -----------------
@@ -222,7 +239,7 @@ The schemes are general and configured, not one class per provider.
 | `TJwtWebhookSignature` | a JSON Web Token: HS256/384/512, RS256/384/512, ES256/384/512, with claim checks |
 | `THttpMessageWebhookSignature` | HTTP Message Signatures, RFC 9421 — the message lists what it covers |
 | `TTokenWebhookSignature` | a shared secret presented as it is, in a header, the query string, or a parameter |
-| `TIpWebhookVerifier` | an address allow list, with CIDR and an optional trusted-proxy hop |
+| `TIpWebhookVerifier` | an address allow list, with CIDR and a chain of trusted proxies |
 | `TSnsWebhookVerifier` | Amazon SNS, whose signed string is a canonicalization of the body's own fields |
 | `TAnyWebhookSignature` / `TAllWebhookSignature` | several of the above, for a secret rotation or a layered check |
 

@@ -22,7 +22,11 @@ It decides whether an inbound webhook is authentic, and signs outbound ones. Wit
   problem: it turns an unreachable endpoint into what looks like a stream of forged requests.
   The package throws in that case, and treats that distinction as part of the contract.
 - **What it does not read.** A delivery is never parsed, logged, or acted on before its
-  signature has been checked.
+  signature has been checked -- the body is not decoded until then, and a request whose
+  declared length is over the endpoint's limit is refused before it is read.
+- **Who hears about it.** A refused delivery reaches `onRefused` and never `onWebhook`, so a
+  handler on the accepted path cannot be shown a forgery. An endpoint with no verifier
+  accepts everything by design; `RequireVerifier` turns that into a configuration error.
 
 ## What it is not responsible for
 
