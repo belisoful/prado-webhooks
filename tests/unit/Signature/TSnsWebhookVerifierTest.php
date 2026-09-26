@@ -313,4 +313,254 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 			$canonical
 		);
 	}
+
+	// ── Fields of the wrong type ───────────────────────────────────────────────
+
+	/**
+	 * The values a JSON body can carry where a string is expected. Each used to reach a
+	 * cast, an array offset, or a concatenation that PHP reports, and PRADO turns a
+	 * reported warning into an exception -- which the provider sees as a 500.
+	 * @return array<string, array{0: mixed}>
+	 */
+	public static function wrongTypes(): array
+	{
+		return [
+			'a list' => [['2']],
+			'an object' => [['version' => '2']],
+			'a nested object' => [['a' => ['b' => ['c' => '2']]]],
+			'null' => [null],
+			'true' => [true],
+			'false' => [false],
+			'a float' => [2.5],
+		];
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testASignatureVersionOfTheWrongTypeIsRefusedRatherThanRaising(mixed $value)
+	{
+		$message = $this->message();
+		$message['SignatureVersion'] = $value;
+
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+		$this->assertSame([], $this->_client->urls, 'nothing is fetched for a message that cannot be verified');
+	}
+
+	public function testAWholeNumberSignatureVersionIsReadAsItsText()
+	{
+		// A JSON encoder somewhere may write the version as a number; "2" and 2 are the same
+		// version, and the canonical string does not include it.
+		$message = $this->message();
+		$message['SignatureVersion'] = 2;
+
+		$this->assertTrue($this->verifier()->verify($this->request($message)));
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testASignatureOfTheWrongTypeIsRefused(mixed $value)
+	{
+		$message = $this->message();
+		$message['Signature'] = $value;
+
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+		$this->assertSame([], $this->_client->urls, 'no signature, no fetch');
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testACertificateUrlOfTheWrongTypeIsRefusedAndNeverFetched(mixed $value)
+	{
+		$message = $this->message();
+		$message['SigningCertURL'] = $value;
+
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+		$this->assertSame([], $this->_client->urls);
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testATopicArnOfTheWrongTypeIsRefused(mixed $value)
+	{
+		$message = $this->message();
+		$message['TopicArn'] = $value;
+
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testATypeOfTheWrongTypeIsRefusedInVerifyAndInTheCanonicalString(mixed $value)
+	{
+		$message = $this->message();
+		$message['Type'] = $value;
+
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+		// canonicalString() is public, and an array offset of the wrong type is a TypeError.
+		$this->assertNull($this->verifier()->canonicalString($message));
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testATimestampOfTheWrongTypeIsRefusedWhenAgeIsChecked(mixed $value)
+	{
+		$verifier = $this->verifier();
+		$verifier->setMaxAge(300);
+		$message = $this->message();
+		$message['Timestamp'] = $value;
+
+		$this->assertFalse($verifier->verify($this->request($message)));
+	}
+
+	/**
+	 * @dataProvider wrongTypes
+	 * @param mixed $value
+	 */
+	public function testACanonicalFieldOfTheWrongTypeIsSkippedNotConcatenated(mixed $value)
+	{
+		// The signature was made over the real fields, so a message whose Message or
+		// Subject has been replaced by a structure does not verify -- and does not raise.
+		foreach (['Message', 'MessageId', 'Subject'] as $field) {
+			$message = $this->message(['Subject' => 'A subject']);
+			$message[$field] = $value;
+
+			$this->assertFalse($this->verifier()->verify($this->request($message)), $field);
+			$this->assertIsString($this->verifier()->canonicalString($message), $field . ' still canonicalizes');
+		}
+	}
+
+	public function testANumericCanonicalFieldContributesItsText()
+	{
+		$this->assertSame(
+			"Message\n42\nMessageId\n7\nType\nNotification\n",
+			$this->verifier()->canonicalString(['Type' => 'Notification', 'Message' => 42, 'MessageId' => 7])
+		);
+		$this->assertSame(
+			"Type\nNotification\n",
+			$this->verifier()->canonicalString(['Type' => 'Notification', 'Message' => true, 'MessageId' => null, 'Subject' => []])
+		);
+	}
+
+	public function testAJsonListBodyIsRefused()
+	{
+		$this->assertFalse($this->verifier()->verify(new TWebhookRequest('POST', '["Notification"]')));
+		$this->assertFalse($this->verifier()->verify(new TWebhookRequest('POST', '"Notification"')));
+		$this->assertFalse($this->verifier()->verify(new TWebhookRequest('POST', '')));
+	}
+
+	// ── The certificate URL shape ──────────────────────────────────────────────
+
+	public function testTheDefaultCertificatePatternRequiresAPemPathAndNoQuery()
+	{
+		// What Amazon's own validator requires, so nothing SNS sends is refused by it.
+		foreach ([
+			'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
+			'https://sns.cn-north-1.amazonaws.com.cn/SimpleNotificationService-abc.pem',
+		] as $url) {
+			$this->assertMatchesRegularExpression(TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN, $url, $url);
+		}
+		foreach ([
+			'https://sns.us-east-1.amazonaws.com/cert.pem?x=1',
+			'https://sns.us-east-1.amazonaws.com/cert.pem#frag',
+			'https://sns.us-east-1.amazonaws.com/cert.txt',
+			'https://sns.us-east-1.amazonaws.com/cert.pem.html',
+			'https://sns.us-east-1.amazonaws.com/',
+			'https://sns.us-east-1.amazonaws.com/.pem',
+			'https://sns.us-east-1.amazonaws.com/a?b=c.pem',
+			'https://sns.us-east-1.amazonaws.com/cert.PEM',
+		] as $url) {
+			$this->assertDoesNotMatchRegularExpression(TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN, $url, $url);
+		}
+	}
+
+	public function testACertificateUrlThatIsNotAPemPathIsNeverFetched()
+	{
+		foreach ([
+			'https://sns.us-east-1.amazonaws.com/cert.pem?redirect=elsewhere',
+			'https://sns.us-east-1.amazonaws.com/index.html',
+		] as $url) {
+			$this->assertFalse($this->verifier()->verify($this->request($this->message(['SigningCertURL' => $url]))), $url);
+		}
+		$this->assertSame([], $this->_client->urls);
+	}
+
+	public function testAMessageWithNoSignatureNeverFetchesTheCertificate()
+	{
+		$message = $this->message();
+		unset($message['Signature']);
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+
+		$message['Signature'] = '';
+		$this->assertFalse($this->verifier()->verify($this->request($message)));
+
+		$this->assertSame([], $this->_client->urls, 'an unsigned body must not cost a network round trip');
+	}
+
+	// ── MaxAge ─────────────────────────────────────────────────────────────────
+
+	public function testWithoutMaxAgeAStaleMessageReplaysIndefinitely()
+	{
+		// Pinned so the default is a documented choice rather than an accident: the
+		// timestamp is signed, but nothing bounds it until MaxAge is set.
+		$verifier = $this->verifier();
+		$this->assertSame(0, $verifier->getMaxAge());
+
+		$stale = $this->message(['Timestamp' => '2016-01-01T00:00:00.000Z']);
+		$this->assertTrue($verifier->verify($this->request($stale)));
+		$this->assertTrue($verifier->verify($this->request($stale)), 'and again');
+
+		$verifier->setMaxAge(300);
+		$this->assertFalse($verifier->verify($this->request($stale)));
+	}
+
+	public function testMaxAgeBoundsBothDirections()
+	{
+		$verifier = $this->verifier();
+		$verifier->setMaxAge(60);
+
+		$this->assertTrue($verifier->verify($this->request($this->message())));
+		$this->assertFalse($verifier->verify($this->request($this->message([
+			'Timestamp' => gmdate('Y-m-d\TH:i:s.000\Z', time() + 3600),
+		]))), 'a timestamp from the future is as wrong as a stale one');
+		$this->assertFalse($verifier->verify($this->request($this->message([
+			'Timestamp' => gmdate('Y-m-d\TH:i:s.000\Z', time() - 61),
+		]))));
+	}
+
+	public function testAMissingTimestampIsRefusedOnlyWhenAgeIsChecked()
+	{
+		$message = $this->message();
+		unset($message['Timestamp']);
+		$unsigned = $this->message(['Timestamp' => null]);
+		unset($unsigned['Timestamp']);
+
+		// Re-sign without the field so the signature itself is not what refuses it.
+		$fields = TSnsWebhookVerifier::SIGNED_FIELDS['Notification'];
+		$canonical = '';
+		foreach ($fields as $field) {
+			if (isset($message[$field]) && $field !== 'Timestamp') {
+				$canonical .= $field . "\n" . $message[$field] . "\n";
+			}
+		}
+		openssl_sign($canonical, $signature, self::$privateKey, 'sha256');
+		$message['Signature'] = base64_encode($signature);
+
+		$this->assertTrue($this->verifier()->verify($this->request($message)));
+
+		$verifier = $this->verifier();
+		$verifier->setMaxAge(300);
+		$this->assertFalse($verifier->verify($this->request($message)));
+	}
 }

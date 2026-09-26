@@ -36,7 +36,10 @@ namespace Belisoful\Prado\Web\Webhooks\Signature;
  * The key is normalized through OpenSSL before being rewritten, which is what lets a
  * caller pass whatever the provider published: a PKCS#1 `RSA PRIVATE KEY`, a PKCS#8
  * `PRIVATE KEY`, a bare `PUBLIC KEY`, or an X.509 certificate all arrive here and leave as
- * the one shape this rewrites.
+ * the one shape this rewrites. What that shape is depends on the OpenSSL underneath: 3.x
+ * exports a private key as PKCS#8, 1.1 as PKCS#1, so the rewrite reads both -- a PKCS#1
+ * key has no identifier to replace and is wrapped into the PKCS#8 or `SubjectPublicKeyInfo`
+ * structure that carries one.
  *
  * **The salt length is part of the key, so it has to be the one the sender used.** There is
  * no negotiation and no auto-detection: a mismatch fails every delivery, looking exactly
@@ -112,6 +115,13 @@ trait TWebhookRsaPssTrait
 	/**
 	 * Replaces the algorithm identifier of a normalized key with `id-RSASSA-PSS` and its
 	 * parameters.
+	 * A PKCS#1 key -- `RSA PRIVATE KEY` or `RSA PUBLIC KEY`, which is what OpenSSL 1.1
+	 * exports and what many providers publish -- carries no algorithm identifier to
+	 * rewrite. It is wrapped instead: the whole structure becomes the key material of a
+	 * PKCS#8 `PrivateKeyInfo` or a `SubjectPublicKeyInfo` whose identifier is
+	 * `id-RSASSA-PSS`, which is byte for byte what OpenSSL 3 would have exported before the
+	 * rewrite.
+	 *
 	 * @param string $pem the normalized key.
 	 * @param string $digest the hash and mask generation hash.
 	 * @param int $saltLength the salt length in bytes.
@@ -135,6 +145,8 @@ trait TWebhookRsaPssTrait
 			return null;
 		}
 		$body = $outer[1];
+		$identifier = $this->pssDer(0x30, $this->pssDer(0x06, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a") . $parameters);
+		$expected = $private ? 0x04 : 0x03;
 
 		// A private key opens with a version INTEGER that has to be carried across; a public
 		// key opens with the algorithm identifier itself.
@@ -150,26 +162,61 @@ trait TWebhookRsaPssTrait
 		}
 
 		$algorithm = $this->pssDerRead($body, $offset);
-		if ($algorithm === null || $algorithm[0] !== 0x30) {
+		if ($algorithm === null) {
 			return null;
 		}
-		$keyMaterial = $this->pssDerRead($body, $algorithm[2]);
-		$expected = $private ? 0x04 : 0x03;
-		if ($keyMaterial === null || $keyMaterial[0] !== $expected) {
-			return null;
+		if ($algorithm[0] === 0x02) {
+			// No identifier to rewrite: this is PKCS#1, an RSAPrivateKey (version, n, e,
+			// d, ...) or an RSAPublicKey (n, e). Wrap the whole structure as the key
+			// material of the outer type the identifier belongs in.
+			if (!$this->isPkcs1Body($body, $private)) {
+				return null;
+			}
+			$rewritten = $private
+				? $this->pssDer(0x30, $this->pssDer(0x02, "\x00") . $identifier . $this->pssDer(0x04, $der))
+				: $this->pssDer(0x30, $identifier . $this->pssDer(0x03, "\x00" . $der));
+		} else {
+			if ($algorithm[0] !== 0x30) {
+				return null;
+			}
+			$keyMaterial = $this->pssDerRead($body, $algorithm[2]);
+			if ($keyMaterial === null || $keyMaterial[0] !== $expected) {
+				return null;
+			}
+			$rewritten = $this->pssDer(0x30, $prefix . $identifier . $this->pssDer($expected, $keyMaterial[1]));
 		}
-
-		$rewritten = $this->pssDer(
-			0x30,
-			$prefix
-			. $this->pssDer(0x30, $this->pssDer(0x06, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a") . $parameters)
-			. $this->pssDer($expected, $keyMaterial[1])
-		);
 		$label = $private ? 'PRIVATE KEY' : 'PUBLIC KEY';
 
 		return "-----BEGIN {$label}-----\n"
 			. chunk_split(base64_encode($rewritten), 64, "\n")
 			. "-----END {$label}-----\n";
+	}
+
+	/**
+	 * Whether a SEQUENCE body is the shape PKCS#1 gives an RSA key: nothing but INTEGERs,
+	 * exactly two of them for an `RSAPublicKey` and at least nine for an `RSAPrivateKey`.
+	 * A PKCS#8 `PrivateKeyInfo` also opens with an INTEGER, and this is what keeps one
+	 * handed over as a public key from being wrapped into nonsense.
+	 * @param string $body the contents of the outer SEQUENCE.
+	 * @param bool $private whether a private key is expected.
+	 * @return bool whether the body is a PKCS#1 key of the expected kind.
+	 * @since 0.2.0
+	 */
+	protected function isPkcs1Body(string $body, bool $private): bool
+	{
+		$count = 0;
+		$offset = 0;
+		$size = strlen($body);
+		while ($offset < $size) {
+			$element = $this->pssDerRead($body, $offset);
+			if ($element === null || $element[0] !== 0x02) {
+				return false;
+			}
+			$offset = $element[2];
+			$count++;
+		}
+
+		return $private ? $count >= 9 : $count === 2;
 	}
 
 	/**

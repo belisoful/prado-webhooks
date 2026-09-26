@@ -193,4 +193,109 @@ class TFieldedWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$this->expectException(TConfigurationException::class);
 		$signature->verify($this->request(['X-Signature' => $this->header(time())]));
 	}
+
+	public function testVerifyingWithoutASecretIsAConfigurationErrorEvenWhenNothingIsPresented()
+	{
+		// A verifier with no secret must not degrade into an endpoint that quietly refuses
+		// every delivery: with or without a header, it is misconfigured.
+		$signature = new TFieldedWebhookSignature();
+		$signature->setHeader('X-Signature');
+
+		$this->expectException(TConfigurationException::class);
+		$signature->verify($this->request());
+	}
+
+	// ── The packed id across retries ───────────────────────────────────────────
+
+	private function idSignature(): TFieldedWebhookSignature
+	{
+		$signature = $this->signature();
+		$signature->setIdField('id');
+		$signature->setIdName('X-Webhook-Delivery');
+		$signature->setPayloadFormat('{id}.{timestamp}.{body}');
+
+		return $signature;
+	}
+
+	private function packedId(string $header): ?string
+	{
+		return preg_match('/(?:^|,)id=([^,]+)(?:,|$)/', $header, $match) ? $match[1] : null;
+	}
+
+	public function testTheIdTheRequestCarriesIsPackedRatherThanMinted()
+	{
+		// What the sender does: the delivery's own id goes in the request under IdName, and
+		// every attempt packs that same id, so a retry is recognizable as a repeat.
+		$signature = $this->idSignature();
+		$request = $this->request(['X-Webhook-Delivery' => 'msg_2Kt6rHq']);
+
+		$first = $signature->sign($request)['X-Signature'];
+		$second = $signature->sign($request)['X-Signature'];
+
+		$this->assertSame('msg_2Kt6rHq', $this->packedId($first));
+		$this->assertSame('msg_2Kt6rHq', $this->packedId($second));
+		$this->assertTrue($signature->verify($this->request(['X-Signature' => $first])));
+		$this->assertTrue($signature->verify($this->request(['X-Signature' => $second])));
+	}
+
+	public function testTheIdIsReadFromWhereverIdNameSaysCaseInsensitively()
+	{
+		$signature = $this->idSignature();
+
+		$this->assertSame(
+			'msg_lower',
+			$this->packedId($signature->sign($this->request(['x-webhook-delivery' => 'msg_lower']))['X-Signature'])
+		);
+		$this->assertSame(
+			'msg_trimmed',
+			$this->packedId($signature->sign($this->request(['X-Webhook-Delivery' => '  msg_trimmed  ']))['X-Signature'])
+		);
+	}
+
+	public function testWithoutAnIdInTheRequestEachCallMintsItsOwn()
+	{
+		$signature = $this->idSignature();
+
+		$first = $this->packedId($signature->sign($this->request())['X-Signature']);
+		$second = $this->packedId($signature->sign($this->request())['X-Signature']);
+
+		$this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $first);
+		$this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $second);
+		$this->assertNotSame($first, $second);
+
+		// An empty header is no id at all.
+		$blank = $this->packedId($signature->sign($this->request(['X-Webhook-Delivery' => '  ']))['X-Signature']);
+		$this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $blank);
+	}
+
+	public function testWithoutIdNameTheRequestIsNotConsulted()
+	{
+		// Backward compatible: a scheme that names no id source mints, as it always did.
+		$signature = $this->signature();
+		$signature->setIdField('id');
+		$signature->setPayloadFormat('{id}.{timestamp}.{body}');
+		$request = $this->request(['X-Webhook-Delivery' => 'msg_ignored']);
+
+		$packed = $this->packedId($signature->sign($request)['X-Signature']);
+		$this->assertNotSame('msg_ignored', $packed);
+		$this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $packed);
+	}
+
+	public function testVerificationReadsThePackedIdNotTheHeader()
+	{
+		// The receiving side takes the id out of the packed value, so the header the sender
+		// used while signing is not needed on arrival -- and cannot override what was packed.
+		$signature = $this->idSignature();
+		$headers = $signature->sign($this->request(['X-Webhook-Delivery' => 'msg_2Kt6rHq']));
+
+		$this->assertTrue($signature->verify($this->request($headers)), 'without the id header');
+		$this->assertTrue($signature->verify($this->request($headers + ['X-Webhook-Delivery' => 'msg_2Kt6rHq'])));
+		$this->assertTrue(
+			$signature->verify($this->request($headers + ['X-Webhook-Delivery' => 'msg_other'])),
+			'a header disagreeing with the packed id is ignored: the packed one is what was signed'
+		);
+
+		$tampered = str_replace('id=msg_2Kt6rHq', 'id=msg_other', $headers['X-Signature']);
+		$this->assertFalse($signature->verify($this->request(['X-Signature' => $tampered])));
+	}
 }

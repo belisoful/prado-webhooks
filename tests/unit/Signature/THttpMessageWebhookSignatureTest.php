@@ -320,6 +320,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	/**
 	 * Builds a correctly signed request whose signature parameters are whatever is given,
 	 * so the parameter checks can be exercised without sign() choosing them.
+	 * @param string $parameters
 	 * @return array<string, string> the three headers.
 	 */
 	private function headersWithParameters(string $parameters): array
@@ -623,6 +624,9 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	 * Every way a key can be unusable, in both directions. Each is configuration rather than
 	 * anything a caller sent, so each has to be an exception and not a quiet false.
 	 * @dataProvider unusableKeys
+	 * @param string $algorithm
+	 * @param string $property
+	 * @param string $material
 	 */
 	public function testAnUnusableKeyIsAConfigurationError(string $algorithm, string $property, string $material)
 	{
@@ -694,5 +698,522 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 		$this->expectException(TConfigurationException::class);
 		$signature->sign($this->request());
+	}
+
+	// ── Header components ──────────────────────────────────────────────────────
+
+	/**
+	 * Signs a base assembled by hand over the given component lines, so the test rather
+	 * than sign() decides what each component's value is.
+	 * @param array<string, string> $lines component identifier (serialized) => value.
+	 * @param string $parameters the signature parameters, `;created=...`.
+	 * @return array<string, string> the two signature headers.
+	 */
+	private function handSigned(array $lines, string $parameters): array
+	{
+		$input = '(' . implode(' ', array_map(
+			static fn ($identifier) => $identifier,
+			array_keys($lines)
+		)) . ')' . $parameters;
+		$base = '';
+		foreach ($lines as $identifier => $value) {
+			$base .= $identifier . ': ' . $value . "\n";
+		}
+		$base .= '"@signature-params": ' . $input;
+
+		return [
+			'Signature-Input' => 'sig1=' . $input,
+			'Signature' => 'sig1=:' . base64_encode(hash_hmac('sha256', $base, self::SECRET, true)) . ':',
+		];
+	}
+
+	public function testARepeatedHeaderContributesEveryInstanceJoinedByCommaSpace()
+	{
+		// RFC 9421 section 2.1. Reading only the first instance would let the second be
+		// rewritten under a valid signature.
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, x-tenant');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@method"' => 'POST', '"x-tenant"' => '7, 8'], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertTrue($signature->verify($this->request($headers + ['X-Tenant' => ['7', '8']])));
+		$this->assertFalse($signature->verify($this->request($headers + ['X-Tenant' => ['7', '9']])));
+		$this->assertFalse($signature->verify($this->request($headers + ['X-Tenant' => ['7']])));
+		$this->assertFalse($signature->verify($this->request($headers + ['X-Tenant' => '7'])));
+	}
+
+	public function testEachHeaderInstanceIsTrimmedAndLineFoldingCollapsed()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, x-tenant');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@method"' => 'POST', '"x-tenant"' => 'a b, c'], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertTrue($signature->verify($this->request($headers + ['X-Tenant' => ["  a\r\n\t b  ", "\tc "]])));
+		$this->assertTrue($signature->verify($this->request($headers + ['x-tenant' => ['a b', 'c']])), 'case of the name');
+	}
+
+	public function testARepeatedHeaderRoundTripsThroughSigning()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, x-tenant');
+
+		$request = $this->request(['X-Tenant' => ['7', '8']]);
+		$signed = $this->signed($signature, $request);
+
+		$this->assertTrue($signature->verify($signed));
+		$headers = $signed->getHeaders();
+		$headers['X-Tenant'] = ['8', '7'];
+		$this->assertFalse($signature->verify($signed->withHeaders($headers)), 'order is part of the value');
+	}
+
+	public function testAnEmptyHeaderInstanceListIsAbsentButAnEmptyValueIsPresent()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, x-tenant');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@method"' => 'POST', '"x-tenant"' => ''], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertTrue($signature->verify($this->request($headers + ['X-Tenant' => ''])));
+		$this->assertFalse($signature->verify($this->request($headers + ['X-Tenant' => []])));
+		$this->assertFalse($signature->verify($this->request($headers)));
+	}
+
+	public function testTheSignatureHeadersThemselvesMayBeRepeated()
+	{
+		// A dictionary field split over two header lines is one dictionary.
+		$signature = $this->hmac();
+		$signed = $this->signed($signature);
+		$headers = $signed->getHeaders();
+		$headers['Signature-Input'] = ['sig0=("@method");created=' . time(), $headers['Signature-Input']];
+		$headers['Signature'] = ['sig0=:YWJj:', $headers['Signature']];
+
+		$this->assertTrue($signature->verify($signed->withHeaders($headers)));
+	}
+
+	// ── Derived components ─────────────────────────────────────────────────────
+
+	/**
+	 * @dataProvider authorities
+	 * @param string $url
+	 * @param string $authority
+	 */
+	public function testTheAuthorityIsLowerCaseWithoutADefaultPort(string $url, string $authority)
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@authority');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@authority"' => $authority], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertTrue(
+			$signature->verify(new TWebhookRequest('POST', self::BODY, $headers, $url)),
+			$url . ' has the authority ' . $authority
+		);
+	}
+
+	public static function authorities(): array
+	{
+		return [
+			['https://example.com/hook', 'example.com'],
+			['https://Example.COM/hook', 'example.com'],
+			['https://example.com:443/hook', 'example.com'],
+			['HTTPS://example.com:443/hook', 'example.com'],
+			['http://example.com:80/hook', 'example.com'],
+			['https://example.com:80/hook', 'example.com:80'],
+			['http://example.com:443/hook', 'example.com:443'],
+			['https://example.com:8443/hook', 'example.com:8443'],
+			['https://[::1]:8443/hook', '[::1]:8443'],
+		];
+	}
+
+	public function testASignerAndAVerifierAgreeOnTheAuthorityWhateverThePortSpelling()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@authority, @path');
+
+		$signed = $this->signed($signature, new TWebhookRequest('POST', self::BODY, [], 'https://Example.com:443/hook'));
+
+		$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $signed->getHeaders(), 'https://example.com/hook')));
+	}
+
+	/**
+	 * @dataProvider paths
+	 * @param string $url
+	 * @param string $path
+	 * @param string $target
+	 */
+	public function testThePathOfAUrlWithNoPathIsASlash(string $url, string $path, string $target)
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@path, @request-target');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@path"' => $path, '"@request-target"' => $target], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, $url)), $url);
+	}
+
+	public static function paths(): array
+	{
+		return [
+			['https://example.com', '/', '/'],
+			['https://example.com?a=1', '/', '/?a=1'],
+			['https://example.com/', '/', '/'],
+			['https://example.com/hook?a=1', '/hook', '/hook?a=1'],
+		];
+	}
+
+	public function testARequestWithNoUrlHasNoPath()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@path');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@path"' => '/'], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertFalse($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, '')));
+	}
+
+	// ── Signature-Input parsing ────────────────────────────────────────────────
+
+	public function testAQuotedParameterValueMayHoldASemicolonOrAnEscapedQuote()
+	{
+		$signature = $this->hmac();
+		$signature->setMaxAge(0);
+
+		foreach (['a;b', 'say "hi"', 'x=y;z="w"', '(paren)'] as $keyId) {
+			$signature->setKeyId($keyId);
+			$quoted = '"' . addcslashes($keyId, '\\"') . '"';
+			$headers = $this->headersWithParameters(';created=' . time() . ';keyid=' . $quoted);
+
+			$this->assertTrue($signature->verify($this->request($headers)), $keyId);
+		}
+	}
+
+	public function testAComponentParameterDoesNotLeakIntoTheSignatureParameters()
+	{
+		// Before this was parsed properly, `;key="x"` attached to a component was read as
+		// the signature parameter `key`, and `;keyid="k"` on a component could satisfy the
+		// key id check.
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method');
+		$signature->setMaxAge(0);
+
+		// The message's key id is on a component, not in the signature parameters.
+		$headers = $this->handSigned(['"@method";keyid="prado"' => 'POST'], ';created=' . time());
+		$this->assertFalse($signature->verify($this->request($headers)));
+
+		// Without a key id to check, the same message is still refused: a component
+		// parameter this class does not implement fails closed.
+		$signature->setKeyId('');
+		$this->assertFalse($signature->verify($this->request($headers)));
+	}
+
+	public function testAComponentParameterDoesNotLeakIntoTheComponentList()
+	{
+		// `"x-tenant";key="a"` used to be read as the component `x-tenant`, satisfying a
+		// requirement it does not meet.
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, x-tenant');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@method"' => 'POST', '"x-tenant";key="a"' => '1'], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertFalse($signature->verify($this->request($headers + ['X-Tenant' => 'a=1'])));
+	}
+
+	/**
+	 * @dataProvider unsupportedComponentParameters
+	 * @param string $identifier
+	 */
+	public function testAComponentParameterThisClassDoesNotImplementIsRefusedNotMisread(string $identifier)
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned([$identifier => 'POST'], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertFalse($signature->verify($this->request($headers)), $identifier);
+	}
+
+	public static function unsupportedComponentParameters(): array
+	{
+		return [
+			['"@method";sf'],
+			['"@method";bs'],
+			['"@method";req'],
+			['"@method";tr'],
+			['"@method";key="x"'],
+			['"@method";name="x"'],
+			['"@query-param";name="x";sf'],
+			['"@query-param";name=x'],
+			['"@query-param"'],
+		];
+	}
+
+	public function testADuplicateComponentIsRefused()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method');
+		$signature->setMaxAge(0);
+
+		// A hand-built base with the component twice, signed correctly for that base.
+		$input = '("@method" "@method");created=' . time() . ';keyid="prado"';
+		$base = '"@method": POST' . "\n" . '"@method": POST' . "\n" . '"@signature-params": ' . $input;
+		$headers = [
+			'Signature-Input' => 'sig1=' . $input,
+			'Signature' => 'sig1=:' . base64_encode(hash_hmac('sha256', $base, self::SECRET, true)) . ':',
+		];
+		$this->assertFalse($signature->verify($this->request($headers)));
+
+		// Also when the duplicate differs only in spelling.
+		$headers['Signature-Input'] = 'sig1=("@method" "@METHOD");created=' . time() . ';keyid="prado"';
+		$this->assertFalse($signature->verify($this->request($headers)));
+
+		// The same name with different parameters is two components, not a duplicate.
+		$headers = $this->handSigned(
+			['"@query-param";name="a"' => '1', '"@query-param";name="b"' => '2'],
+			';created=' . time() . ';keyid="prado"'
+		);
+		$signature->setRequiredComponents('@query-param;name="a"');
+		$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, 'https://example.com/h?a=1&b=2')));
+	}
+
+	public function testMalformedInnerListsAreRefusedRatherThanThrowing()
+	{
+		$signature = $this->hmac();
+		$signature->setMaxAge(0);
+		foreach ([
+			'("@method"',
+			'("@method" @target-uri)',
+			'(@method)',
+			'("@method");created="abc',
+			'("@method");=1',
+			'("@method");created=1;Keyid="x"',
+			'("@method");created=1 trailing',
+			'("@method";)',
+			'("@method" "x\u0001y")',
+			'("@method" "unterminated)',
+			'()',
+			'',
+			'@method',
+		] as $input) {
+			$this->assertFalse($signature->verify($this->request([
+				'Signature-Input' => 'sig1=' . $input,
+				'Signature' => 'sig1=:YWJj:',
+			])), $input);
+		}
+	}
+
+	public function testTheSignatureParamsLineIsTheOriginalInputVerbatim()
+	{
+		// Whatever spelling the sender used -- spaces after semicolons, parameters in an
+		// unusual order -- the base carries it exactly, because that is what was signed.
+		$signature = $this->hmac();
+		$signature->setMaxAge(0);
+
+		$input = '("@method" "@target-uri" "content-digest"); keyid="prado";created=' . time();
+		$digest = 'sha-256=:' . base64_encode(hash('sha256', self::BODY, true)) . ':';
+		$base = '"@method": POST' . "\n"
+			. '"@target-uri": ' . self::URL . "\n"
+			. '"content-digest": ' . $digest . "\n"
+			. '"@signature-params": ' . $input;
+
+		$this->assertTrue($signature->verify($this->request([
+			'Content-Digest' => $digest,
+			'Signature-Input' => 'sig1=' . $input,
+			'Signature' => 'sig1=:' . base64_encode(hash_hmac('sha256', $base, self::SECRET, true)) . ':',
+		])));
+	}
+
+	// ── @query-param ───────────────────────────────────────────────────────────
+
+	public function testAQueryParameterComponentVerifiesAgainstAHandBuiltBase()
+	{
+		// RFC 9421 section 2.2.8: the value is percent-decoded and re-encoded strictly.
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, "@query-param";name="id"');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(
+			['"@method"' => 'POST', '"@query-param";name="id"' => 'evt%2F1%20a'],
+			';created=' . time() . ';keyid="prado"'
+		);
+
+		foreach ([
+			'https://example.com/hook?id=evt%2F1%20a',
+			'https://example.com/hook?id=evt/1%20a',
+			'https://example.com/hook?id=evt%2f1%20a',
+			'https://example.com/hook?other=1&id=evt%2F1%20a&more=2',
+		] as $url) {
+			$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, $url)), $url);
+		}
+		foreach ([
+			'https://example.com/hook?id=evt%2F2',
+			'https://example.com/hook?id=evt%2F1%20a&id=evt%2F1%20a',
+			'https://example.com/hook?ID=evt%2F1%20a',
+			'https://example.com/hook',
+			'https://example.com/hook?id',
+		] as $url) {
+			$this->assertFalse($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, $url)), $url);
+		}
+	}
+
+	public function testAQueryParameterComponentRoundTripsThroughSigning()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@method, @query-param;name="id", content-digest');
+
+		$this->assertSame(['@method', '@query-param;name="id"', 'content-digest'], $signature->getRequiredComponents());
+
+		$request = new TWebhookRequest('POST', self::BODY, [], 'https://example.com/hook?id=evt_1&x=y');
+		$signed = $this->signed($signature, $request);
+
+		$this->assertStringContainsString('("@method" "@query-param";name="id" "content-digest")', $signed->getHeader('Signature-Input'));
+		$this->assertTrue($signature->verify($signed));
+		$this->assertFalse($signature->verify(new TWebhookRequest('POST', self::BODY, $signed->getHeaders(), 'https://example.com/hook?id=evt_2&x=y')));
+		// An uncovered parameter may change.
+		$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $signed->getHeaders(), 'https://example.com/hook?id=evt_1&x=z')));
+	}
+
+	public function testAnEmptyQueryParameterValueIsAnEmptyComponent()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@query-param;name="qux"');
+		$signature->setMaxAge(0);
+
+		$headers = $this->handSigned(['"@query-param";name="qux"' => ''], ';created=' . time() . ';keyid="prado"');
+
+		$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, 'https://example.com/?qux=')));
+		$this->assertTrue($signature->verify(new TWebhookRequest('POST', self::BODY, $headers, 'https://example.com/?qux')));
+	}
+
+	public function testSigningAQueryParameterTheUrlDoesNotCarryIsAConfigurationError()
+	{
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@query-param;name="id"');
+
+		$this->expectException(TConfigurationException::class);
+		$signature->sign(new TWebhookRequest('POST', self::BODY, [], 'https://example.com/hook?other=1'));
+	}
+
+	public function testRequiredComponentsAreNormalizedToOneSpelling()
+	{
+		$signature = new THttpMessageWebhookSignature();
+		$signature->setRequiredComponents(['"@Method"', ' X-Tenant ', '"@query-param"; name="Pet"', '@query-param;name="a";sf']);
+
+		$this->assertSame(
+			['@method', 'x-tenant', '@query-param;name="Pet"', '@query-param;name="a";sf'],
+			$signature->getRequiredComponents()
+		);
+	}
+
+	// ── Labels ─────────────────────────────────────────────────────────────────
+
+	public function testWhenTheFirstLabelFailsTheSecondMayStillPass()
+	{
+		$signature = $this->hmac();
+		$signed = $this->signed($signature);
+		$headers = $signed->getHeaders();
+
+		// A first label that verifies against nothing, then the genuine one.
+		$headers['Signature-Input'] = 'sig0=("@method");created=' . time() . ';keyid="prado", ' . $headers['Signature-Input'];
+		$headers['Signature'] = 'sig0=:' . base64_encode(str_repeat("\0", 32)) . ':, ' . $headers['Signature'];
+
+		$this->assertTrue($signature->verify($signed->withHeaders($headers)));
+
+		// And pinned to the label, the failing one alone is refused.
+		$signature->setLabel('sig0');
+		$this->assertFalse($signature->verify($signed->withHeaders($headers)));
+	}
+
+	// ── Parameters ─────────────────────────────────────────────────────────────
+
+	public function testANonNumericExpiresRejectsTheSignature()
+	{
+		// It used to be overlooked, which let a signature declare itself unexpiring in words.
+		$signature = $this->hmac();
+		$signature->setMaxAge(0);
+
+		foreach ([';expires=never', ';expires="' . (time() + 300) . '"', ';expires=?1', ';expires'] as $expires) {
+			$headers = $this->headersWithParameters(';created=' . time() . ';keyid="prado"' . $expires);
+			$this->assertFalse($signature->verify($this->request($headers)), $expires);
+		}
+		$headers = $this->headersWithParameters(';created=' . time() . ';keyid="prado";expires=' . (time() + 300));
+		$this->assertTrue($signature->verify($this->request($headers)));
+	}
+
+	public function testACreatedInTheFutureBeyondMaxAgeIsRejected()
+	{
+		$signature = $this->hmac();
+
+		$headers = $this->headersWithParameters(';created=' . (time() + 3600) . ';keyid="prado"');
+		$this->assertFalse($signature->verify($this->request($headers)));
+
+		$headers = $this->headersWithParameters(';created=' . (time() + 60) . ';keyid="prado"');
+		$this->assertTrue($signature->verify($this->request($headers)), 'inside the window in either direction');
+	}
+
+	// ── Mixed algorithm lists ──────────────────────────────────────────────────
+
+	public function testWithAMixedListTheSenderCannotChooseWhichExceptionIsRaised()
+	{
+		// Only a public key is configured; a message declaring hmac-sha256 is refused,
+		// not reported as a 500 of the sender's choosing.
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('rsa-v1_5-sha256, hmac-sha256');
+		$verifier->setPublicKey(self::$rsa['public']);
+		$verifier->setMaxAge(0);
+
+		$hmac = $this->headersWithParameters(';created=' . time() . ';alg="hmac-sha256"');
+		$this->assertFalse($verifier->verify($this->request($hmac)));
+
+		$signer = new THttpMessageWebhookSignature();
+		$signer->setAlgorithms('rsa-v1_5-sha256');
+		$signer->setPrivateKey(self::$rsa['private']);
+		$this->assertTrue($verifier->verify($this->signed($signer)));
+	}
+
+	public function testWithAMixedListAndOnlyASecretAnAsymmetricSignatureIsRefusedNotAnError()
+	{
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('hmac-sha256, rsa-pss-sha512, ecdsa-p256-sha256, ed25519');
+		$verifier->setSecret(self::SECRET);
+		$verifier->setMaxAge(0);
+
+		foreach (['rsa-pss-sha512', 'ecdsa-p256-sha256', 'ed25519'] as $algorithm) {
+			$headers = $this->headersWithParameters(';created=' . time() . ';alg="' . $algorithm . '"');
+			$this->assertFalse($verifier->verify($this->request($headers)), $algorithm);
+		}
+		$this->assertTrue($verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="hmac-sha256"'))));
+	}
+
+	public function testASingleFamilyWithNoKeyStillThrows()
+	{
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('hmac-sha256, hmac-sha512');
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="hmac-sha256"')));
+	}
+
+	public function testAMixedListWithNoKeyAtAllStillThrows()
+	{
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('rsa-v1_5-sha256, hmac-sha256');
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="hmac-sha256"')));
+	}
+
+	public function testVerifyingWithoutAnyKeyIsAConfigurationErrorEvenWhenNothingIsPresented()
+	{
+		$this->expectException(TConfigurationException::class);
+		(new THttpMessageWebhookSignature())->verify($this->request());
 	}
 }

@@ -49,6 +49,19 @@ use Prado\TPropertyValue;
  * any notification will follow. Confirm only topics the application expects -- the
  * `TopicArn` check above already refuses the rest.
  *
+ * **Replay is not refused by default.** {@see setMaxAge MaxAge} is 0 unless set, so a
+ * captured message verifies again however old it is; the `Timestamp` is signed, but only a
+ * limit makes it mean anything. Set one that comfortably exceeds how long SNS retries the
+ * topic's deliveries, and let the handler deduplicate on `MessageId` for what is left.
+ *
+ * The certificate URL is fetched only after the message has presented a `Signature`, and
+ * only when it names a `.pem` path on an SNS host with no query string -- the same shape
+ * Amazon's own validator requires -- so a body with no signature never causes a fetch.
+ *
+ * Every field is read defensively: a value of the wrong type -- a list where a string is
+ * expected, an object as the version -- refuses the message rather than raising an error
+ * a provider would see as a 500.
+ *
  * This verifies and does not sign: the signature belongs in the body, and a signer returns
  * headers.
  *
@@ -57,8 +70,12 @@ use Prado\TPropertyValue;
  */
 class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 {
-	/** @var string the hosts a signing certificate may be fetched from. */
-	public const DEFAULT_CERTIFICATE_URL_PATTERN = '#^https://sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/#';
+	/**
+	 * The URLs a signing certificate may be fetched from: an SNS host, a `.pem` path, and
+	 * no query string or fragment, which is what Amazon's own validator requires.
+	 * @var string
+	 */
+	public const DEFAULT_CERTIFICATE_URL_PATTERN = '#^https://sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/[^?\#]+\.pem$#';
 
 	/** @var array<string, string[]> the fields each message type signs, in the order it signs them. */
 	public const SIGNED_FIELDS = [
@@ -117,8 +134,8 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 			return false;
 		}
 
-		$type = is_string($message['Type'] ?? null) ? $message['Type'] : '';
-		if (!isset(self::SIGNED_FIELDS[$type])) {
+		$type = $this->fieldText($message, 'Type');
+		if ($type === null || !isset(self::SIGNED_FIELDS[$type])) {
 			return false;
 		}
 		if (!in_array($message['TopicArn'] ?? null, $this->_topicArns, true)) {
@@ -126,8 +143,11 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 			return false;
 		}
 
-		$version = (string) ($message['SignatureVersion'] ?? '');
-		if (!in_array($version, $this->_signatureVersions, true) || !isset(self::SIGNATURE_VERSIONS[$version])) {
+		// Read as text only when it is text or a whole number: SNS sends "1" or "2", and a
+		// list or an object here is not a version but a message shaped to raise an error.
+		$version = $message['SignatureVersion'] ?? null;
+		$version = is_string($version) || is_int($version) ? (string) $version : null;
+		if ($version === null || !in_array($version, $this->_signatureVersions, true) || !isset(self::SIGNATURE_VERSIONS[$version])) {
 			return false;
 		}
 		if (!$this->isRecent($message)) {
@@ -165,20 +185,41 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 	 */
 	public function canonicalString(array $message): ?string
 	{
-		$fields = self::SIGNED_FIELDS[$message['Type'] ?? ''] ?? null;
+		$type = $this->fieldText($message, 'Type');
+		$fields = $type === null ? null : (self::SIGNED_FIELDS[$type] ?? null);
 		if ($fields === null) {
 			return null;
 		}
 
 		$canonical = '';
 		foreach ($fields as $field) {
-			if (!isset($message[$field]) || !is_scalar($message[$field])) {
+			$value = $this->fieldText($message, $field);
+			if ($value === null) {
 				continue;
 			}
-			$canonical .= $field . "\n" . $message[$field] . "\n";
+			$canonical .= $field . "\n" . $value . "\n";
 		}
 
 		return $canonical;
+	}
+
+	/**
+	 * Reads one field of the message as text.
+	 *
+	 * SNS sends every field as a string. A number is tolerated because a JSON encoder may
+	 * have written one; anything else -- a list, an object, a boolean, null -- is not a
+	 * value this scheme signs and is treated as absent. Reading it any other way would let
+	 * a message shaped to raise a type error reach the provider as a 500.
+	 *
+	 * @param array<string, mixed> $message the decoded message.
+	 * @param string $field the field name.
+	 * @return null|string the field as text, or null when it is absent or not text.
+	 */
+	protected function fieldText(array $message, string $field): ?string
+	{
+		$value = $message[$field] ?? null;
+
+		return is_string($value) || is_int($value) || is_float($value) ? (string) $value : null;
 	}
 
 	/**
@@ -309,7 +350,8 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 	}
 
 	/**
-	 * @return int how old a message may be, in seconds. Defaults to 0, which accepts any.
+	 * @return int how old a message may be, in seconds. **Defaults to 0, which accepts a
+	 *   message of any age: a captured message replays indefinitely until this is set.**
 	 */
 	public function getMaxAge(): int
 	{
@@ -317,9 +359,12 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 	}
 
 	/**
-	 * Bounds how old a message may be, read from its `Timestamp`. Off by default because the
-	 * timestamp is signed but SNS retries its own deliveries for a long time, and a limit
-	 * set too tight refuses redeliveries that were genuinely sent.
+	 * Bounds how far from now a message's `Timestamp` may be, in either direction. Off by
+	 * default -- and off means a captured message verifies again a year later -- because
+	 * the timestamp is signed but SNS retries its own deliveries for a long time, and a
+	 * limit set too tight refuses redeliveries that were genuinely sent. Set it to something
+	 * comfortably above the topic's retry window, and let the handler deduplicate on
+	 * `MessageId` for what is left.
 	 * @param mixed $value the age limit in seconds; 0 or less accepts any message.
 	 */
 	public function setMaxAge($value): void

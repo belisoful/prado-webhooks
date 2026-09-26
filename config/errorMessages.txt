@@ -23,6 +23,7 @@ webhooks_payload_invalid			= The webhook payload cannot be encoded for sending: 
 webhooks_payload_token_unknown		= '{0}' in the PayloadFormat of {1} is not a token this package defines.
 webhooks_prefix_invalid				= '{0}' in {2}.{1} has no usable prefix length; an unreadable one would allow the whole address family.
 webhooks_private_key_required		= {0} has no PrivateKey, so it cannot sign.
+webhooks_pss_digest_unsupported		= '{0}' is not a digest {1} can use with PSS padding; a PSS key names its hash by identifier, so use sha256, sha384, or sha512.
 webhooks_pss_key_invalid			= {1}.{0} cannot be used with PSS padding: it has to be an RSA key OpenSSL can read.
 webhooks_public_key_required		= {0} has no PublicKey, so it cannot verify.
 webhooks_queue_connection_invalid	= '{0}' is not a TDataSourceConfig module, so {1} has no database to keep its queue in.

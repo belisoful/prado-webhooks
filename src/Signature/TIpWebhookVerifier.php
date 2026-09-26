@@ -34,9 +34,16 @@ use Prado\TPropertyValue;
  *
  * **A forwarded header is written by whoever is talking to you.** It is read only when the
  * connection itself comes from a {@see setTrustedProxies TrustedProxies} address, and even
- * then only the last entry the trusted hop added is believed -- everything to the left of
- * it was supplied by the caller. Configure `ForwardedHeader` without `TrustedProxies` and
- * verification refuses rather than trusting the caller's own claim about where they are.
+ * then it is walked from the right: each entry that is itself a trusted proxy is the hop
+ * that appended the one before it, and the first entry that is not a trusted proxy is the
+ * caller. Everything to the left of that was supplied by the caller and is never read.
+ * Configure `ForwardedHeader` without `TrustedProxies` and verification refuses rather
+ * than trusting the caller's own claim about where they are.
+ *
+ * Entries are read as proxies write them: an IPv4 address may carry a `:port`, an IPv6
+ * address may be bracketed with one, and an IPv4-mapped IPv6 address (`::ffff:192.0.2.1`)
+ * is the IPv4 address it maps, so an allow list written in IPv4 matches a connection a
+ * dual-stack listener reported in IPv6.
  *
  * This is a verifier and not a signer: an address is a property of the connection, not
  * something a sender can put in a header. It authenticates the peer and nothing about the
@@ -90,7 +97,11 @@ class TIpWebhookVerifier extends TApplicationComponent implements IWebhookVerifi
 	protected function clientAddress(TWebhookRequest $request): ?string
 	{
 		$address = $request->getRemoteAddress();
-		if ($address === null || $this->_forwardedHeader === null) {
+		if ($address === null) {
+			return null;
+		}
+		$address = $this->normalizeAddress($address) ?? $address;
+		if ($this->_forwardedHeader === null) {
 			return $address;
 		}
 		if (!$this->matchesAny($address, $this->_trustedProxies)) {
@@ -103,9 +114,51 @@ class TIpWebhookVerifier extends TApplicationComponent implements IWebhookVerifi
 			return $address;
 		}
 		$hops = array_values(array_filter(array_map('trim', explode(',', $forwarded)), static fn ($h) => $h !== ''));
+		if ($hops === []) {
+			return $address;
+		}
 
-		// The trusted hop appends; everything before its entry came from the caller.
-		return end($hops) ?: $address;
+		// Each trusted hop appended the entry to its left, so walk from the right past
+		// every trusted proxy: the first entry that is not one is the caller. Everything
+		// further left is the caller's own writing. A chain made of nothing but trusted
+		// proxies is judged by its last entry, which is at least something a trusted hop
+		// wrote.
+		foreach (array_reverse($hops) as $hop) {
+			$candidate = $this->normalizeAddress($hop) ?? $hop;
+			if (!$this->matchesAny($candidate, $this->_trustedProxies)) {
+				return $candidate;
+			}
+		}
+
+		return $this->normalizeAddress((string) end($hops)) ?? (string) end($hops);
+	}
+
+	/**
+	 * Reads an address as a proxy writes it: strips a port from `192.0.2.1:8080` and from
+	 * `[2001:db8::1]:8080`, unbrackets `[2001:db8::1]`, and folds an IPv4-mapped IPv6
+	 * address such as `::ffff:192.0.2.1` to the IPv4 address it names, so it matches an
+	 * allow list written in IPv4.
+	 * @param string $address the address as written.
+	 * @return null|string the bare address, or null when it is not an address at all.
+	 * @since 0.2.0
+	 */
+	protected function normalizeAddress(string $address): ?string
+	{
+		$address = trim($address);
+		if (preg_match('/^\[([^\]]+)\](?::\d{1,5})?$/', $address, $match)) {
+			$address = $match[1];
+		} elseif (preg_match('/^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/', $address, $match)) {
+			$address = $match[1];
+		}
+		$packed = @inet_pton($address);
+		if ($packed === false) {
+			return null;
+		}
+		if (strlen($packed) === 16 && substr($packed, 0, 12) === str_repeat("\x00", 10) . "\xff\xff") {
+			return (string) inet_ntop(substr($packed, 12));
+		}
+
+		return $address;
 	}
 
 	/**

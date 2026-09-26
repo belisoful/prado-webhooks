@@ -1,5 +1,6 @@
 <?php
 
+use Belisoful\Prado\Web\Webhooks\Signature\IWebhookVerifier;
 use Belisoful\Prado\Web\Webhooks\Signature\TAllWebhookSignature;
 use Belisoful\Prado\Web\Webhooks\Signature\TAnyWebhookSignature;
 use Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature;
@@ -7,6 +8,25 @@ use Belisoful\Prado\Web\Webhooks\Signature\TIpWebhookVerifier;
 use Belisoful\Prado\Web\Webhooks\TWebhookRequest;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Xml\TXmlDocument;
+
+/**
+ * A verifier that answers what it is told to and counts how often it was asked.
+ */
+class TestRecordingVerifier implements IWebhookVerifier
+{
+	public int $calls = 0;
+
+	public function __construct(private bool $_answer)
+	{
+	}
+
+	public function verify(TWebhookRequest $request): bool
+	{
+		$this->calls++;
+
+		return $this->_answer;
+	}
+}
 
 class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
@@ -192,5 +212,82 @@ class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$any->init($this->xml('<signature />'));
 
 		$this->assertSame([], $any->getSignatures());
+	}
+
+	// ── Every child is evaluated ───────────────────────────────────────────────
+
+	public function testAnyEvaluatesEveryChildEvenAfterOneAccepts()
+	{
+		// No short circuit: which child matched must not be observable in the response
+		// time, and a child that throws on configuration must throw whatever its siblings
+		// said.
+		$first = new TestRecordingVerifier(true);
+		$second = new TestRecordingVerifier(false);
+		$third = new TestRecordingVerifier(true);
+		$any = new TAnyWebhookSignature();
+		foreach ([$first, $second, $third] as $child) {
+			$any->addSignature($child);
+		}
+
+		$this->assertTrue($any->verify($this->request()));
+		$this->assertSame([1, 1, 1], [$first->calls, $second->calls, $third->calls]);
+	}
+
+	public function testAllEvaluatesEveryChildEvenAfterOneRefuses()
+	{
+		$first = new TestRecordingVerifier(false);
+		$second = new TestRecordingVerifier(true);
+		$third = new TestRecordingVerifier(false);
+		$all = new TAllWebhookSignature();
+		foreach ([$first, $second, $third] as $child) {
+			$all->addSignature($child);
+		}
+
+		$this->assertFalse($all->verify($this->request()));
+		$this->assertSame([1, 1, 1], [$first->calls, $second->calls, $third->calls]);
+	}
+
+	public function testAnyRefusesWhenEveryChildRefusesAndAllAcceptsWhenEveryChildAccepts()
+	{
+		$any = new TAnyWebhookSignature();
+		$any->addSignature(new TestRecordingVerifier(false));
+		$any->addSignature(new TestRecordingVerifier(false));
+		$this->assertFalse($any->verify($this->request()));
+
+		$all = new TAllWebhookSignature();
+		$all->addSignature(new TestRecordingVerifier(true));
+		$all->addSignature(new TestRecordingVerifier(true));
+		$this->assertTrue($all->verify($this->request()));
+	}
+
+	public function testAChildThatOnlySignsCountsAsRefusingInAVerification()
+	{
+		// A composite made of a signer and a verifier: the signer has nothing to say about
+		// an inbound request, and All must not read that silence as consent.
+		$signer = new class () implements Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner {
+			public function sign(TWebhookRequest $request): array
+			{
+				return ['X-Nothing' => '1'];
+			}
+		};
+		$all = new TAllWebhookSignature();
+		$all->addSignature($signer);
+		$all->addSignature(new TestRecordingVerifier(true));
+		$this->assertFalse($all->verify($this->request()));
+
+		$any = new TAnyWebhookSignature();
+		$any->addSignature($signer);
+		$any->addSignature(new TestRecordingVerifier(true));
+		$this->assertTrue($any->verify($this->request()));
+	}
+
+	public function testAMisconfiguredChildThrowsWhateverItsSiblingsSaid()
+	{
+		$any = new TAnyWebhookSignature();
+		$any->addSignature(new TestRecordingVerifier(true));
+		$any->addSignature(new THmacWebhookSignature());
+
+		$this->expectException(TConfigurationException::class);
+		$any->verify($this->request());
 	}
 }

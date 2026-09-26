@@ -36,6 +36,11 @@ use Prado\TPropertyValue;
  * A repeated signature field is how overlapping secrets work: a provider mid-rotation sends
  * one per active secret, and verification accepts the request when any of them matches.
  *
+ * An {@see setIdField IdField} packs a delivery id in as well. Set {@see setIdName IdName}
+ * alongside it when sending: the sender puts the delivery's id there before signing, and
+ * the same id is then packed on every attempt, so a receiver deduplicating on it sees a
+ * retry as the repeat it is.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
  */
@@ -143,6 +148,9 @@ class TFieldedWebhookSignature extends THmacWebhookSignature
 	 */
 	public function verify(TWebhookRequest $request): bool
 	{
+		// As in THmacWebhookSignature: no secret is a configuration error whatever arrives.
+		$this->getSecretKey();
+
 		$presented = $this->presentedSignatures($request);
 		if ($presented === [] || !$this->bodyHashHolds($request)) {
 			return false;
@@ -159,6 +167,15 @@ class TFieldedWebhookSignature extends THmacWebhookSignature
 
 	/**
 	 * Signs an outbound request, packing the fields into one header.
+	 *
+	 * When {@see getIdField IdField} is set, the id packed into the value is read from the
+	 * request first -- from wherever {@see getIdName IdName} says a delivery id is found --
+	 * and minted only when the request carries none. That is what keeps a retried delivery
+	 * recognizable: {@see \Belisoful\Prado\Web\Webhooks\TWebhookSender} puts the delivery's
+	 * own id under `IdName` before signing, so every attempt packs the same id and a
+	 * receiver deduplicating on it sees one event rather than one per attempt. A caller
+	 * signing by hand without setting `IdName` gets a fresh id per call, as before.
+	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request about to be made.
 	 * @throws \Prado\Exceptions\TConfigurationException when the scheme is not configured.
 	 * @return array<string, string> the one packed header.
@@ -169,14 +186,32 @@ class TFieldedWebhookSignature extends THmacWebhookSignature
 		$fields = [$this->_timestampField . $this->_valueSeparator . $bound['timestamp']];
 
 		if ($this->_idField !== null) {
-			// Minted per call, because the id is packed into the value being written and so
-			// cannot be read back out of the request the way a header-borne one can.
-			$bound['id'] = bin2hex(random_bytes(16));
+			$bound['id'] = $this->requestedId($request) ?? bin2hex(random_bytes(16));
 			$fields[] = $this->_idField . $this->_valueSeparator . $bound['id'];
 		}
 		$fields[] = $this->_signatureField . $this->_valueSeparator . $this->computeSignature($request, $bound);
 
 		return [$this->getName() => implode($this->_fieldSeparator, $fields)];
+	}
+
+	/**
+	 * Reads the delivery id an outbound request already carries, under
+	 * {@see getIdName IdName}, so the packed id can be the one the sender chose rather than
+	 * one minted here. Distinct from {@see presentedId}, which on the receiving side reads
+	 * the id back out of the packed value.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request about to be made.
+	 * @return null|string the id, or null when `IdName` is unset or the request carries none.
+	 * @since 0.2.0
+	 */
+	protected function requestedId(TWebhookRequest $request): ?string
+	{
+		$name = $this->getIdName();
+		if ($name === null) {
+			return null;
+		}
+		$id = $this->readValue($request, $name);
+
+		return $id === null || trim($id) === '' ? null : trim($id);
 	}
 
 	/**
@@ -273,8 +308,9 @@ class TFieldedWebhookSignature extends THmacWebhookSignature
 
 	/**
 	 * @return null|string the field the delivery id is packed into, or null when the scheme
-	 *   packs none. Defaults to null. Unlike a delivery id in a header, one packed here is
-	 *   minted per call, so a retry of the same delivery carries a new id.
+	 *   packs none. Defaults to null. The id packed is the one the request carries under
+	 *   {@see getIdName IdName} when it carries one -- which is how a sender keeps it the
+	 *   same across a delivery's retries -- and is minted per call otherwise.
 	 */
 	public function getIdField(): ?string
 	{
@@ -282,6 +318,10 @@ class TFieldedWebhookSignature extends THmacWebhookSignature
 	}
 
 	/**
+	 * Names the field the delivery id is packed into. Set {@see setIdName IdName} as well
+	 * when the id has to survive retries: the sender then hands the delivery's own id over
+	 * under that name, and this packs it rather than minting a fresh one per attempt. On the
+	 * receiving side the id is read back out of the packed value, not out of `IdName`.
 	 * @param mixed $value the id field name, or an empty value for none.
 	 */
 	public function setIdField($value): void

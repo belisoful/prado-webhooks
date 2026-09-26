@@ -73,6 +73,11 @@ class THmacWebhookSignature extends TWebhookSignature implements IWebhookVerifie
 	 */
 	public function verify(TWebhookRequest $request): bool
 	{
+		// Checked before the request is looked at: a verifier with no secret is a
+		// configuration error whatever arrives, and must not degrade into an endpoint that
+		// reports every delivery, signed or not, as a forgery.
+		$this->getSecretKey();
+
 		$presented = $this->presentedSignatures($request);
 		if ($presented === [] || !$this->bodyHashHolds($request)) {
 			return false;

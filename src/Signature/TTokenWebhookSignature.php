@@ -74,12 +74,16 @@ class TTokenWebhookSignature extends TWebhookSignature implements IWebhookVerifi
 	 */
 	public function verify(TWebhookRequest $request): bool
 	{
+		// Computed before the request is looked at, so a verifier with no token is a
+		// configuration error whether or not a delivery presents one.
+		$expected = $this->presentedValue();
+
 		$presented = $this->readValue($request, $this->getName());
 		if ($presented === null || !$this->bodyHashHolds($request)) {
 			return false;
 		}
 
-		return hash_equals($this->presentedValue(), $presented);
+		return hash_equals($expected, $presented);
 	}
 
 	/**

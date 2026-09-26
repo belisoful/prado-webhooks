@@ -204,6 +204,8 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 	/**
 	 * @dataProvider pssDigests
+	 * @param string $digest
+	 * @param int $salt
 	 */
 	public function testPssRoundTripsAtEveryDigest(string $digest, int $salt)
 	{
@@ -584,6 +586,191 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 		$this->assertFalse($this->certificateVerifier($client)->verify($this->request(['X-Signature' => 'abc'])));
 		$this->assertSame([], $client->urls);
+	}
+
+	public function testARequestPresentingNoSignatureNeverFetchesTheCertificate()
+	{
+		// The cheapest thing an attacker can send must not cost a network round trip: the
+		// presented signature is checked for before the URL it names is ever fetched.
+		$client = new TestCertificateHttpClient();
+		$client->response = new THttpClientResponse(200, [], self::$publicKey);
+		$signature = $this->certificateVerifier($client);
+
+		$this->assertFalse($signature->verify($this->request(['X-Cert-Url' => 'https://certs.example.com/key.pem'])));
+		$this->assertFalse($signature->verify($this->request([
+			'X-Cert-Url' => 'https://certs.example.com/key.pem',
+			'X-Signature' => '',
+		])));
+		$this->assertSame([], $client->urls);
+	}
+
+	public function testAConfiguredKeyStillFailsAsConfigurationWhenNothingIsPresented()
+	{
+		// Reordering the checks must not turn a broken configuration into a quiet false.
+		$signature = new TPublicKeyWebhookSignature();
+		$signature->setHeader('X-Signature');
+		$signature->setPublicKey('-----BEGIN PUBLIC KEY----- nonsense -----END PUBLIC KEY-----');
+
+		$this->expectException(TConfigurationException::class);
+		$signature->verify($this->request());
+	}
+
+	public function testNoKeyAndNoAllowListIsConfigurationEvenWhenNothingIsPresented()
+	{
+		$signature = new TPublicKeyWebhookSignature();
+		$signature->setHeader('X-Signature');
+
+		$this->expectException(TConfigurationException::class);
+		$signature->verify($this->request());
+	}
+
+	public function testAFetchedBodyThatIsNotAKeyIsNotCached()
+	{
+		// Caching a non-key would refuse every delivery until it expired, and would let one
+		// bad response from the provider's host outlive itself.
+		$client = new TestCertificateHttpClient();
+		$client->response = new THttpClientResponse(200, [], 'not a certificate');
+		$cache = new TestWebhookCache();
+		$signature = $this->certificateVerifier($client);
+		$signature->setCache($cache);
+
+		$headers = $this->signer()->sign($this->request());
+		$headers['X-Cert-Url'] = 'https://certs.example.com/key.pem';
+
+		$this->assertFalse($signature->verify($this->request($headers)));
+		$this->assertSame(0, $cache->writes);
+		$this->assertSame([], $cache->entries);
+
+		// Once the host serves the key, it is used and cached.
+		$client->response = new THttpClientResponse(200, [], self::$publicKey);
+		$this->assertTrue($signature->verify($this->request($headers)));
+		$this->assertSame(1, $cache->writes);
+		$this->assertCount(2, $client->urls);
+	}
+
+	public function testAnOversizedCertificateBodyIsRefusedAndNotCached()
+	{
+		$client = new TestCertificateHttpClient();
+		$client->response = new THttpClientResponse(200, [], self::$publicKey);
+		$cache = new TestWebhookCache();
+		$signature = $this->certificateVerifier($client);
+		$signature->setCache($cache);
+		$signature->setCertificateMaxSize(strlen(self::$publicKey) - 1);
+
+		$headers = $this->signer()->sign($this->request());
+		$headers['X-Cert-Url'] = 'https://certs.example.com/key.pem';
+
+		$this->assertFalse($signature->verify($this->request($headers)));
+		$this->assertSame(0, $cache->writes);
+
+		// Exactly the size is fine: the limit is inclusive.
+		$signature->setCertificateMaxSize(strlen(self::$publicKey));
+		$this->assertTrue($signature->verify($this->request($headers)));
+		$this->assertSame(1, $cache->writes);
+	}
+
+	public function testTheCertificateMaxSizeHasAFloorOfOne()
+	{
+		$signature = new TPublicKeyWebhookSignature();
+		$this->assertSame(TPublicKeyWebhookSignature::DEFAULT_CERTIFICATE_MAX_SIZE, $signature->getCertificateMaxSize());
+		$this->assertSame(65536, $signature->getCertificateMaxSize());
+
+		$signature->setCertificateMaxSize('4096');
+		$this->assertSame(4096, $signature->getCertificateMaxSize());
+
+		foreach ([0, -1, '-500'] as $value) {
+			$signature->setCertificateMaxSize($value);
+			$this->assertSame(1, $signature->getCertificateMaxSize(), (string) $value);
+		}
+	}
+
+	public function testAValueWithoutTheConfiguredPrefixIsNotACandidate()
+	{
+		// Consistent with the keyed schemes: the prefix names the scheme, and a value under
+		// no prefix, or another one, is not this scheme's signature however it decodes.
+		$signer = $this->signer();
+		$headers = $signer->sign($this->request());
+		$bare = $headers['X-Signature'];
+
+		$verifier = $this->verifier();
+		$verifier->setPrefix('rsa-sha256=');
+
+		$this->assertTrue($verifier->verify($this->request(['X-Signature' => 'rsa-sha256=' . $bare])));
+		$this->assertFalse($verifier->verify($this->request(['X-Signature' => $bare])));
+		$this->assertFalse($verifier->verify($this->request(['X-Signature' => 'sha256=' . $bare])));
+		$this->assertFalse($verifier->verify($this->request(['X-Signature' => 'RSA-SHA256=' . $bare])));
+	}
+
+	public function testAmongSeveralCandidatesOnlyThePrefixedOnesCount()
+	{
+		$signer = $this->signer();
+		$bare = $signer->sign($this->request())['X-Signature'];
+
+		$verifier = $this->verifier();
+		$verifier->setPrefix('v1=');
+		$verifier->setSeparator(',');
+
+		$this->assertTrue($verifier->verify($this->request(['X-Signature' => 'v0=' . $bare . ',v1=' . $bare])));
+		$this->assertFalse($verifier->verify($this->request(['X-Signature' => 'v0=' . $bare . ',' . $bare])));
+	}
+
+	public function testAPssDigestOpenSslKnowsButHashDoesNotIsAConfigurationError()
+	{
+		// setAlgorithm accepts what OpenSSL can sign with, which is a longer list than PSS
+		// parameters can name; it used to surface as a ValueError from hash().
+		$candidates = array_values(array_diff(array_map('strtolower', openssl_get_md_methods()), hash_algos()));
+		if ($candidates === []) {
+			$this->markTestSkipped('every OpenSSL digest here is one hash() knows');
+		}
+		$signature = $this->verifier();
+		$signature->setPadding('pss');
+		$signature->setAlgorithm($candidates[0]);
+
+		try {
+			$signature->getSaltLength();
+			$this->fail('the salt length should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertStringContainsString('PSS', $e->getMessage());
+		}
+
+		$this->expectException(TConfigurationException::class);
+		$signature->verify($this->request(['X-Signature' => 'abc']));
+	}
+
+	public function testAPssDigestWithNoParametersIsAConfigurationError()
+	{
+		// hash() knows sha1, but a PSS key names its hash by identifier and this package
+		// carries only the SHA-2 family, so it is refused as configuration rather than as
+		// an unreadable key.
+		$signer = $this->signer();
+		$signer->setPadding('pss');
+		$signer->setAlgorithm('sha1');
+
+		try {
+			$signer->sign($this->request());
+			$this->fail('signing should be refused');
+		} catch (TConfigurationException $e) {
+			$this->assertStringContainsString('sha1', $e->getMessage());
+		}
+
+		$verifier = $this->verifier();
+		$verifier->setPadding('pss');
+		$verifier->setAlgorithm('sha1');
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request(['X-Signature' => 'abc']));
+	}
+
+	public function testAnExplicitSaltLengthDoesNotNeedTheDigestLength()
+	{
+		$candidates = array_values(array_diff(array_map('strtolower', openssl_get_md_methods()), hash_algos()));
+		if ($candidates === []) {
+			$this->markTestSkipped('every OpenSSL digest here is one hash() knows');
+		}
+		$signature = new TPublicKeyWebhookSignature();
+		$signature->setAlgorithm($candidates[0]);
+		$signature->setSaltLength(32);
+
+		$this->assertSame(32, $signature->getSaltLength());
 	}
 
 	// ── Configuration ──────────────────────────────────────────────────────────

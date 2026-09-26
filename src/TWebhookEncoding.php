@@ -64,6 +64,11 @@ enum TWebhookEncoding: string
 	 * returns false rather than throwing on malformed input, because that input is usually
 	 * something an attacker supplied.
 	 *
+	 * Base64url is read strictly, as RFC 4648 section 5 and RFC 7515 define it: only the
+	 * URL-safe alphabet, no padding, and no whitespace. A JWS segment that carries `+`, `/`,
+	 * or `=` is not one this package minted, and two spellings of one signature are two
+	 * things to get wrong.
+	 *
 	 * @param string $encoded the text.
 	 * @return false|string the bytes, or false when $encoded is not valid in this encoding.
 	 */
@@ -73,7 +78,9 @@ enum TWebhookEncoding: string
 			self::Raw => $encoded,
 			self::Hex => ctype_xdigit($encoded) && strlen($encoded) % 2 === 0 ? hex2bin($encoded) : false,
 			self::Base64 => base64_decode($encoded, true),
-			self::Base64Url => base64_decode(str_pad(strtr($encoded, '-_', '+/'), (int) (ceil(strlen($encoded) / 4) * 4), '='), true),
+			self::Base64Url => preg_match('/\A[A-Za-z0-9_-]*\z/', $encoded) === 1 && strlen($encoded) % 4 !== 1
+				? base64_decode(str_pad(strtr($encoded, '-_', '+/'), (int) (ceil(strlen($encoded) / 4) * 4), '='), true)
+				: false,
 		};
 	}
 

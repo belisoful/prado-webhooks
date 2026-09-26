@@ -45,10 +45,17 @@ use Prado\Web\THttpHeaderName;
  * stops the family of attacks where a token arrives claiming `none`, or claiming `HS256`
  * against a key the application meant to use asymmetrically.
  *
- * `exp` and `nbf` are honored when present, within {@see setLeeway Leeway}. {@see setIssuer
- * Issuer} and {@see setAudience Audience} are checked when set, and setting both is worth
- * the trouble: a token minted by the same provider for some other customer is otherwise a
- * valid token.
+ * `exp` and `nbf` are honored when present, within {@see setLeeway Leeway}; one that is
+ * present but not a number refuses the token rather than being overlooked, and
+ * {@see setRequireExpiry RequireExpiry} refuses a token that carries no `exp` at all.
+ * {@see setIssuer Issuer} and {@see setAudience Audience} are checked when set, and setting
+ * both is worth the trouble: a token minted by the same provider for some other customer
+ * is otherwise a valid token.
+ *
+ * A header carrying `crit` (RFC 7515 section 4.1.11) is refused: it declares extensions the
+ * recipient must understand, and this class understands none. The `Bearer` scheme word is
+ * matched without regard to case, as RFC 7235 says an auth-scheme is; a prefix that is not
+ * an auth-scheme -- one that does not end in a space -- is matched exactly.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
@@ -98,6 +105,9 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	/** @var int how long a signed token is valid, in seconds */
 	private int $_lifetime = 300;
 
+	/** @var bool whether a token without `exp` is refused */
+	private bool $_requireExpiry = false;
+
 	/**
 	 * Defaults to a bearer token in the `Authorization` header, the form a JWT almost
 	 * always arrives in.
@@ -112,22 +122,24 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	/**
 	 * Verifies the token a request presents.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request as received.
-	 * @throws \Prado\Exceptions\TConfigurationException when no key is configured for an
-	 *   allowed algorithm.
+	 * @throws \Prado\Exceptions\TConfigurationException when no allowed algorithm has a key
+	 *   configured, whatever the request carries, or the key for the declared one will
+	 *   not parse.
 	 * @return bool whether the token verifies and its claims hold for this delivery.
 	 */
 	public function verify(TWebhookRequest $request): bool
 	{
+		// Before the request is looked at: a verifier with no key for any algorithm it
+		// allows is misconfigured whatever arrives, and must not quietly refuse everything.
+		$this->requireSomeKey();
+
 		$presented = $this->readValue($request, $this->getName());
 		if ($presented === null || !$this->bodyHashHolds($request)) {
 			return false;
 		}
-		$prefix = $this->getPrefix();
-		if ($prefix !== '') {
-			if (!str_starts_with($presented, $prefix)) {
-				return false;
-			}
-			$presented = substr($presented, strlen($prefix));
+		$presented = $this->stripPrefix($presented);
+		if ($presented === null) {
+			return false;
 		}
 
 		$parts = explode('.', trim($presented));
@@ -142,6 +154,11 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 		if ($header === null || $claims === null || $signature === false || $signature === '') {
 			return false;
 		}
+		if (array_key_exists('crit', $header)) {
+			// RFC 7515 section 4.1.11: `crit` names extensions the recipient must understand,
+			// and a recipient that understands none of them must refuse the token.
+			return false;
+		}
 
 		// The token says which algorithm it used; the application says which it will accept.
 		$algorithm = is_string($header['alg'] ?? null) ? $header['alg'] : '';
@@ -153,6 +170,60 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 		}
 
 		return $this->claimsHold($claims, $request);
+	}
+
+	/**
+	 * Removes {@see getPrefix Prefix} from the presented value.
+	 *
+	 * A prefix that ends in a space is an HTTP auth-scheme -- `Bearer ` -- and RFC 7235
+	 * says an auth-scheme is matched without regard to case, so `bearer` and `BEARER` are
+	 * the same scheme. Any other prefix is a literal the provider chose, and is matched
+	 * exactly.
+	 *
+	 * @param string $presented the presented value.
+	 * @return null|string the token, or null when the value does not carry the prefix.
+	 * @since 0.2.0
+	 */
+	protected function stripPrefix(string $presented): ?string
+	{
+		$prefix = $this->getPrefix();
+		if ($prefix === '') {
+			return $presented;
+		}
+		$carried = str_ends_with($prefix, ' ')
+			? strncasecmp($presented, $prefix, strlen($prefix)) === 0
+			: str_starts_with($presented, $prefix);
+
+		return $carried ? substr($presented, strlen($prefix)) : null;
+	}
+
+	/**
+	 * Whether key material is configured for the family an algorithm belongs to.
+	 * @param string $algorithm one of {@see ALGORITHMS}.
+	 * @return bool whether the secret (HS) or the public key (RS, ES) is set.
+	 * @since 0.2.0
+	 */
+	protected function hasKeyFor(string $algorithm): bool
+	{
+		return $algorithm[0] === 'H' ? $this->_secret !== '' : $this->_publicKey !== '';
+	}
+
+	/**
+	 * Requires that at least one allowed algorithm has key material to verify with.
+	 * @throws \Prado\Exceptions\TConfigurationException when none does.
+	 * @since 0.2.0
+	 */
+	protected function requireSomeKey(): void
+	{
+		foreach ($this->_algorithms as $algorithm) {
+			if ($this->hasKeyFor($algorithm)) {
+				return;
+			}
+		}
+		throw new TConfigurationException(
+			($this->_algorithms[0] ?? 'H')[0] === 'H' ? 'webhooks_secret_required' : 'webhooks_public_key_required',
+			static::class
+		);
 	}
 
 	/**
@@ -197,10 +268,18 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	protected function claimsHold(array $claims, TWebhookRequest $request): bool
 	{
 		$now = time();
-		if (isset($claims['exp']) && is_numeric($claims['exp']) && $now - $this->_leeway >= (int) $claims['exp']) {
+		// A present `exp` or `nbf` that is not a number refuses the token: a claim that
+		// cannot be read is not one that can be honored, and overlooking it would let a
+		// token that says "expired: yes, in words" through.
+		if (array_key_exists('exp', $claims)) {
+			if (!is_numeric($claims['exp']) || $now - $this->_leeway >= (int) $claims['exp']) {
+				return false;
+			}
+		} elseif ($this->_requireExpiry) {
 			return false;
 		}
-		if (isset($claims['nbf']) && is_numeric($claims['nbf']) && $now + $this->_leeway < (int) $claims['nbf']) {
+		if (array_key_exists('nbf', $claims)
+			&& (!is_numeric($claims['nbf']) || $now + $this->_leeway < (int) $claims['nbf'])) {
 			return false;
 		}
 		if ($this->_issuer !== null && ($claims['iss'] ?? null) !== $this->_issuer) {
@@ -233,26 +312,31 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	}
 
 	/**
+	 * When the allow list mixes families -- `RS256` alongside `HS256`, say -- and only one
+	 * family has key material, a token declaring the other is refused rather than reported as
+	 * a configuration error: the sender chose that algorithm, and a sender must not be able
+	 * to choose which exception the endpoint raises. The exception is kept for the case
+	 * where no allowed algorithm has any key at all, which is genuinely unconfigured.
+	 *
 	 * @param string $algorithm the algorithm the token declared, already allow listed.
 	 * @param string $signing the signing input, `header.claims`.
 	 * @param string $signature the raw signature bytes.
-	 * @throws \Prado\Exceptions\TConfigurationException when no key is configured for the family.
+	 * @throws \Prado\Exceptions\TConfigurationException when no allowed algorithm has a key.
 	 * @return bool whether the signature verifies.
 	 */
 	protected function verifySignature(string $algorithm, string $signing, string $signature): bool
 	{
 		$digest = self::ALGORITHMS[$algorithm];
 
-		if ($algorithm[0] === 'H') {
-			if ($this->_secret === '') {
-				throw new TConfigurationException('webhooks_secret_required', static::class);
-			}
+		if (!$this->hasKeyFor($algorithm)) {
+			// Another allowed family is configured, so this is the sender's choice, not ours.
+			$this->requireSomeKey();
 
-			return hash_equals(hash_hmac($digest, $signing, $this->_secret, true), $signature);
+			return false;
 		}
 
-		if ($this->_publicKey === '') {
-			throw new TConfigurationException('webhooks_public_key_required', static::class);
+		if ($algorithm[0] === 'H') {
+			return hash_equals(hash_hmac($digest, $signing, $this->_secret, true), $signature);
 		}
 		$key = openssl_pkey_get_public($this->readKeyMaterial($this->_publicKey));
 		if ($key === false) {
@@ -504,5 +588,28 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	public function setLifetime($value): void
 	{
 		$this->_lifetime = max(1, TPropertyValue::ensureInteger($value));
+	}
+
+	/**
+	 * @return bool whether a token carrying no `exp` is refused. Defaults to false, which
+	 *   honors `exp` when present and accepts a token without one.
+	 * @since 0.2.0
+	 */
+	public function getRequireExpiry(): bool
+	{
+		return $this->_requireExpiry;
+	}
+
+	/**
+	 * Requires every token to carry an `exp`. Without one a captured token is good for ever,
+	 * so turn this on for any provider that issues expiring tokens -- which is nearly all of
+	 * them; it is off by default only so that a provider which does not is not refused
+	 * outright on upgrade.
+	 * @param mixed $value whether to refuse a token without `exp`.
+	 * @since 0.2.0
+	 */
+	public function setRequireExpiry($value): void
+	{
+		$this->_requireExpiry = TPropertyValue::ensureBoolean($value);
 	}
 }

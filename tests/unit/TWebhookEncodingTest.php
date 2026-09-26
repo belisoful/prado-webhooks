@@ -47,6 +47,43 @@ class TWebhookEncodingTest extends PHPUnit\Framework\TestCase
 		$this->assertFalse(TWebhookEncoding::Base64->decode('!!!!'));
 	}
 
+	public function testBase64UrlIsDecodedStrictly()
+	{
+		// RFC 4648 section 5 and RFC 7515: the URL-safe alphabet only, no padding, no
+		// whitespace. A JWS segment spelled any other way was not made by a conforming
+		// signer, and two spellings of one signature are two things to get wrong.
+		$raw = $this->raw();
+		$standard = base64_encode($raw);
+		$url = TWebhookEncoding::Base64Url->encode($raw);
+
+		$this->assertSame($raw, TWebhookEncoding::Base64Url->decode($url));
+		foreach ([
+			'standard alphabet' => $standard,
+			'padding' => $url . '=',
+			'double padding' => rtrim($standard, '=') . '==',
+			'a plus' => strtr($url, '-', '+'),
+			'a slash' => strtr($url, '_', '/'),
+			'a space' => substr($url, 0, 4) . ' ' . substr($url, 4),
+			'a newline' => $url . "\n",
+			'a leading space' => ' ' . $url,
+			'a tab' => "\t" . $url,
+			'an impossible length' => 'A',
+			'an impossible length, longer' => 'AAAAA',
+			'a period' => 'ab.cd',
+		] as $why => $malformed) {
+			$this->assertFalse(TWebhookEncoding::Base64Url->decode($malformed), $why);
+		}
+	}
+
+	public function testBase64UrlDecodesEveryValidLength()
+	{
+		foreach ([0, 1, 2, 3, 4, 5, 31, 32, 33, 64] as $length) {
+			$raw = $length === 0 ? '' : random_bytes($length);
+			$this->assertSame($raw, TWebhookEncoding::Base64Url->decode(TWebhookEncoding::Base64Url->encode($raw)), "length {$length}");
+		}
+		$this->assertSame('', TWebhookEncoding::Base64Url->decode(''));
+	}
+
 	public function testEnsurePassesAnEncodingThrough()
 	{
 		$this->assertSame(TWebhookEncoding::Base64, TWebhookEncoding::ensure(TWebhookEncoding::Base64));

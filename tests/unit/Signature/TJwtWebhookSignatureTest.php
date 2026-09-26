@@ -242,6 +242,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	 * both halves of that conversion -- and each has its own coordinate size, P-521 being the
 	 * awkward one at 66 bytes for 521 bits.
 	 * @dataProvider ecdsaAlgorithms
+	 * @param string $algorithm
 	 */
 	public function testAnEcdsaTokenRoundTrips(string $algorithm)
 	{
@@ -265,6 +266,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 	/**
 	 * @dataProvider ecdsaAlgorithms
+	 * @param string $algorithm
 	 */
 	public function testAnEcdsaTokenFromAnotherCurveIsRejected(string $algorithm)
 	{
@@ -470,5 +472,207 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	{
 		$this->expectException(TConfigurationException::class);
 		(new TJwtWebhookSignature())->setBodyHashAlgorithm('rot13');
+	}
+
+	// ── exp and nbf ────────────────────────────────────────────────────────────
+
+	/**
+	 * @return array<string, array{0: mixed}>
+	 */
+	public static function nonNumericClaims(): array
+	{
+		return [
+			'a word' => ['never'],
+			'a numeric-looking word' => ['12abc'],
+			'a list' => [[time() + 300]],
+			'an object' => [['at' => time() + 300]],
+			'true' => [true],
+			'null' => [null],
+			'an empty string' => [''],
+		];
+	}
+
+	/**
+	 * @dataProvider nonNumericClaims
+	 * @param mixed $value
+	 */
+	public function testAPresentButNonNumericExpRejectsTheToken(mixed $value)
+	{
+		// It used to be overlooked, which let a token say "expired: yes, in words" and pass.
+		$token = $this->token(['alg' => 'HS256'], ['exp' => $value]);
+
+		$this->assertFalse($this->hs256()->verify($this->request(['Authorization' => 'Bearer ' . $token])));
+	}
+
+	/**
+	 * @dataProvider nonNumericClaims
+	 * @param mixed $value
+	 */
+	public function testAPresentButNonNumericNbfRejectsTheToken(mixed $value)
+	{
+		$token = $this->token(['alg' => 'HS256'], ['nbf' => $value, 'exp' => time() + 300]);
+
+		$this->assertFalse($this->hs256()->verify($this->request(['Authorization' => 'Bearer ' . $token])));
+	}
+
+	public function testNumericStringsAndFloatsAreStillNumbers()
+	{
+		$signature = $this->hs256();
+		foreach ([(string) (time() + 300), (float) (time() + 300), time() + 300] as $exp) {
+			$token = $this->token(['alg' => 'HS256'], ['exp' => $exp, 'nbf' => time() - 5]);
+			$this->assertTrue($signature->verify($this->request(['Authorization' => 'Bearer ' . $token])), var_export($exp, true));
+		}
+	}
+
+	public function testATokenWithoutExpIsAcceptedUnlessExpiryIsRequired()
+	{
+		$signature = $this->hs256();
+		$token = $this->token(['alg' => 'HS256'], ['sub' => 'evt_1']);
+
+		$this->assertFalse($signature->getRequireExpiry());
+		$this->assertTrue($signature->verify($this->request(['Authorization' => 'Bearer ' . $token])));
+
+		$signature->setRequireExpiry(true);
+		$this->assertTrue($signature->getRequireExpiry());
+		$this->assertFalse($signature->verify($this->request(['Authorization' => 'Bearer ' . $token])));
+
+		// With one, it is honored as before.
+		$expiring = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+		$this->assertTrue($signature->verify($this->request(['Authorization' => 'Bearer ' . $expiring])));
+		$expired = $this->token(['alg' => 'HS256'], ['exp' => time() - 3600]);
+		$this->assertFalse($signature->verify($this->request(['Authorization' => 'Bearer ' . $expired])));
+
+		$signature->setRequireExpiry('false');
+		$this->assertFalse($signature->getRequireExpiry());
+	}
+
+	public function testTokensThisClassMintsCarryAnExpiryAndSoPassTheRequirement()
+	{
+		$signature = $this->hs256();
+		$signature->setRequireExpiry(true);
+
+		$this->assertTrue($signature->verify($this->request($signature->sign($this->request()))));
+	}
+
+	// ── The header ─────────────────────────────────────────────────────────────
+
+	public function testATokenWhoseHeaderNamesCriticalExtensionsIsRefused()
+	{
+		// RFC 7515 section 4.1.11: a recipient that does not understand every listed
+		// extension must refuse the token, and this class understands none.
+		foreach ([['b64'], [], 'b64', null] as $crit) {
+			$token = $this->token(['alg' => 'HS256', 'crit' => $crit], ['exp' => time() + 300]);
+			$this->assertFalse(
+				$this->hs256()->verify($this->request(['Authorization' => 'Bearer ' . $token])),
+				'crit=' . json_encode($crit)
+			);
+		}
+	}
+
+	public function testAMissingOrNonStringAlgIsRefused()
+	{
+		foreach ([[], ['alg' => null], ['alg' => ['HS256']], ['alg' => 256], ['alg' => true], ['typ' => 'JWT']] as $header) {
+			$token = $this->token($header, ['exp' => time() + 300]);
+			$this->assertFalse(
+				$this->hs256()->verify($this->request(['Authorization' => 'Bearer ' . $token])),
+				json_encode($header)
+			);
+		}
+	}
+
+	public function testAlgIsMatchedExactlyInCase()
+	{
+		$token = $this->token(['alg' => 'hs256'], ['exp' => time() + 300]);
+
+		$this->assertFalse($this->hs256()->verify($this->request(['Authorization' => 'Bearer ' . $token])));
+	}
+
+	// ── The prefix ─────────────────────────────────────────────────────────────
+
+	public function testTheBearerSchemeWordIsMatchedWithoutRegardToCase()
+	{
+		// RFC 7235: an auth-scheme is case-insensitive, and proxies do rewrite it.
+		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+		foreach (['Bearer ', 'bearer ', 'BEARER ', 'BeArEr '] as $scheme) {
+			$this->assertTrue(
+				$this->hs256()->verify($this->request(['Authorization' => $scheme . $token])),
+				"'{$scheme}' is the Bearer scheme"
+			);
+		}
+		$this->assertFalse($this->hs256()->verify($this->request(['Authorization' => 'Bearer' . $token])), 'no space');
+		$this->assertFalse($this->hs256()->verify($this->request(['Authorization' => 'Basic ' . $token])));
+	}
+
+	public function testAPrefixThatIsNotAnAuthSchemeIsMatchedExactly()
+	{
+		$signature = $this->hs256();
+		$signature->setHeader('X-Token');
+		$signature->setPrefix('jwt=');
+		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+
+		$this->assertTrue($signature->verify($this->request(['X-Token' => 'jwt=' . $token])));
+		$this->assertFalse($signature->verify($this->request(['X-Token' => 'JWT=' . $token])));
+		$this->assertFalse($signature->verify($this->request(['X-Token' => $token])));
+	}
+
+	// ── Mixed algorithm lists ──────────────────────────────────────────────────
+
+	public function testWithAMixedListTheSenderCannotChooseWhichExceptionIsRaised()
+	{
+		// Only a public key is configured; a token declaring HS256 is refused, not a 500.
+		$verifier = new TJwtWebhookSignature();
+		$verifier->setAlgorithms('RS256, HS256');
+		$verifier->setPublicKey(self::$rsa['public']);
+
+		$hs = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+		$this->assertFalse($verifier->verify($this->request(['Authorization' => 'Bearer ' . $hs])));
+
+		// And the configured family still works.
+		$signer = new TJwtWebhookSignature();
+		$signer->setAlgorithms('RS256');
+		$signer->setPrivateKey(self::$rsa['private']);
+		$this->assertTrue($verifier->verify($this->request($signer->sign($this->request()))));
+	}
+
+	public function testWithAMixedListAndOnlyASecretAnRsTokenIsRefusedNotAnError()
+	{
+		$verifier = new TJwtWebhookSignature();
+		$verifier->setAlgorithms('HS256, RS256');
+		$verifier->setSecret(self::SECRET);
+
+		$signer = new TJwtWebhookSignature();
+		$signer->setAlgorithms('RS256');
+		$signer->setPrivateKey(self::$rsa['private']);
+
+		$this->assertFalse($verifier->verify($this->request($signer->sign($this->request()))));
+		$hs = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+		$this->assertTrue($verifier->verify($this->request(['Authorization' => 'Bearer ' . $hs])));
+	}
+
+	public function testASingleFamilyWithNoKeyStillThrows()
+	{
+		// Genuinely unconfigured: nothing in the list can be verified at all.
+		$verifier = new TJwtWebhookSignature();
+		$verifier->setAlgorithms('HS256, HS512');
+		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request(['Authorization' => 'Bearer ' . $token]));
+	}
+
+	public function testAMixedListWithNoKeyAtAllStillThrows()
+	{
+		$verifier = new TJwtWebhookSignature();
+		$verifier->setAlgorithms('RS256, HS256');
+		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request(['Authorization' => 'Bearer ' . $token]));
+	}
+
+	public function testVerifyingWithoutAnyKeyIsAConfigurationErrorEvenWhenNoTokenIsPresented()
+	{
+		$this->expectException(TConfigurationException::class);
+		(new TJwtWebhookSignature())->verify($this->request());
 	}
 }

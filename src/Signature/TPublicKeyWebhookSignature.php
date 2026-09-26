@@ -50,7 +50,11 @@ use Prado\TPropertyValue;
  * *caller* supplied.
  *
  * Fetched certificates are cached when a cache is available, because a provider that names
- * a certificate URL names the same handful over and over.
+ * a certificate URL names the same handful over and over. Only a body that OpenSSL reads
+ * as a key is cached, and only one no larger than
+ * {@see setCertificateMaxSize CertificateMaxSize}; and nothing is fetched at all until the
+ * request has presented a signature, so an unsigned body cannot make the application make
+ * requests.
  *
  * Signing needs {@see setPrivateKey PrivateKey}; with only a public key the scheme
  * verifies, which is the usual arrangement for an application on the receiving end.
@@ -65,6 +69,9 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 
 	/** @var int how long a fetched certificate is cached, in seconds. */
 	public const DEFAULT_CACHE_TTL = 3600;
+
+	/** @var int the largest certificate body accepted from a fetch, in bytes. */
+	public const DEFAULT_CERTIFICATE_MAX_SIZE = 65536;
 
 	/** @var string the public key or certificate, as PEM or a path to it */
 	private string $_publicKey = '';
@@ -95,6 +102,9 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 
 	/** @var int how long a fetched certificate is cached, in seconds */
 	private int $_cacheTtl = self::DEFAULT_CACHE_TTL;
+
+	/** @var int the largest certificate body accepted from a fetch, in bytes */
+	private int $_certificateMaxSize = self::DEFAULT_CERTIFICATE_MAX_SIZE;
 
 	/**
 	 * Defaults the encoding to base64: an asymmetric signature is too long to be worth
@@ -134,6 +144,12 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 * canonical string comes out of the body rather than out of a template -- reuse this
 	 * rather than repeating the key resolution and the decode.
 	 *
+	 * The order matters. The configuration is checked first, so a scheme with no key is a
+	 * configuration error whatever the request looks like; then the request has to present
+	 * a signature; and only then is a certificate the request names fetched. An unsigned
+	 * body is the cheapest thing an attacker can send, and it must not cost a network
+	 * round trip.
+	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request.
 	 * @param string $payload the bytes that were signed.
 	 * @param string $algorithm the digest to verify with.
@@ -142,14 +158,25 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 */
 	protected function verifyAgainstKey(TWebhookRequest $request, string $payload, string $algorithm): bool
 	{
-		$key = $this->resolveKey($request);
+		$key = $this->configuredKey();
+		if ($key === null) {
+			$this->requireCertificateConfiguration($request);
+		}
+
+		$presented = $this->presentedSignatures($request);
+		if ($presented === []) {
+			return false;
+		}
+
+		$key ??= $this->fetchedKey($request);
 		if ($key === null) {
 			return false;
 		}
 
 		$verified = false;
-		foreach ($this->presentedSignatures($request) as $presented) {
-			$raw = $this->getEncoding()->decode($this->stripPrefix($presented));
+		foreach ($presented as $candidate) {
+			$stripped = $this->stripPrefix($candidate);
+			$raw = $stripped === null ? false : $this->getEncoding()->decode($stripped);
 			if ($raw === false || $raw === '') {
 				continue;
 			}
@@ -213,18 +240,49 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 */
 	protected function resolveKey(TWebhookRequest $request): ?\OpenSSLAsymmetricKey
 	{
-		if ($this->_publicKey !== '') {
-			$key = $this->loadPublicKey($this->readKeyMaterial($this->_publicKey));
-			if ($key === false) {
-				throw new TConfigurationException(
-					$this->_padding === TWebhookPadding::Pss ? 'webhooks_pss_key_invalid' : 'webhooks_key_invalid',
-					'PublicKey',
-					static::class
-				);
-			}
-
+		$key = $this->configuredKey();
+		if ($key !== null) {
 			return $key;
 		}
+		$this->requireCertificateConfiguration($request);
+
+		return $this->fetchedKey($request);
+	}
+
+	/**
+	 * Loads the configured {@see getPublicKey PublicKey}, when there is one.
+	 * @throws \Prado\Exceptions\TConfigurationException when a key is configured and will
+	 *   not parse.
+	 * @return null|\OpenSSLAsymmetricKey the key, or null when none is configured.
+	 */
+	protected function configuredKey(): ?\OpenSSLAsymmetricKey
+	{
+		if ($this->_publicKey === '') {
+			return null;
+		}
+		$key = $this->loadPublicKey($this->readKeyMaterial($this->_publicKey));
+		if ($key === false) {
+			throw new TConfigurationException(
+				$this->_padding === TWebhookPadding::Pss ? 'webhooks_pss_key_invalid' : 'webhooks_key_invalid',
+				'PublicKey',
+				static::class
+			);
+		}
+
+		return $key;
+	}
+
+	/**
+	 * Requires that, with no key configured, a certificate URL can be read from the request
+	 * and an allow list exists for it. Checked before anything is read from the request, so
+	 * a scheme with nothing to verify against fails as configuration and not as a stream of
+	 * refused deliveries.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request.
+	 * @throws \Prado\Exceptions\TConfigurationException when the scheme is configured with
+	 *   neither a key nor a certificate URL allow list.
+	 */
+	protected function requireCertificateConfiguration(TWebhookRequest $request): void
+	{
 		if ($this->_certificateUrlName === null && $this->certificateUrl($request) === null) {
 			throw new TConfigurationException('webhooks_public_key_required', static::class);
 		}
@@ -233,9 +291,18 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 			// request is a stranger's instruction until an allow list says otherwise.
 			throw new TConfigurationException('webhooks_certificate_pattern_required', static::class);
 		}
+	}
 
+	/**
+	 * Fetches and loads the certificate the request names, once it has passed the allow list.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request.
+	 * @return null|\OpenSSLAsymmetricKey the key, or null when the request names no URL the
+	 *   allow list accepts, or it will not fetch, or what it serves is not a key.
+	 */
+	protected function fetchedKey(TWebhookRequest $request): ?\OpenSSLAsymmetricKey
+	{
 		$url = $this->certificateUrl($request);
-		if ($url === null || !preg_match($this->_certificateUrlPattern, $url)) {
+		if ($url === null || $this->_certificateUrlPattern === null || !preg_match($this->_certificateUrlPattern, $url)) {
 			return null;
 		}
 		$certificate = $this->fetchCertificate($url);
@@ -263,8 +330,15 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 
 	/**
 	 * Fetches a certificate, through the cache when there is one.
+	 *
+	 * Only a body that OpenSSL reads as a key is returned, and only such a body is cached:
+	 * an error page, an empty document, or anything over
+	 * {@see getCertificateMaxSize CertificateMaxSize} is refused without being written
+	 * anywhere, so a bad response cannot be remembered for the cache lifetime.
+	 *
 	 * @param string $url the certificate URL, already checked against the allow list.
-	 * @return null|string the certificate, or null when it could not be fetched.
+	 * @return null|string the certificate, or null when it could not be fetched or is not
+	 *   a key.
 	 */
 	protected function fetchCertificate(string $url): ?string
 	{
@@ -282,6 +356,14 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 		if (!$response->isSuccess() || ($certificate = $response->getBody()) === '') {
 			return null;
 		}
+		if (strlen($certificate) > $this->_certificateMaxSize) {
+			return null;
+		}
+		if ($this->loadPublicKey($certificate) === false) {
+			// Not cached: a response that is not a key is not worth remembering, and
+			// remembering it would refuse every delivery until it expired.
+			return null;
+		}
 		$cache?->set($cacheKey, $certificate, $this->_cacheTtl);
 
 		return $certificate;
@@ -295,7 +377,7 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	protected function loadPublicKey(string $material): \OpenSSLAsymmetricKey|false
 	{
 		if ($this->_padding === TWebhookPadding::Pss) {
-			return $this->pssKey($material, $this->_algorithm, $this->getSaltLength());
+			return $this->pssKey($material, $this->pssDigest(), $this->getSaltLength());
 		}
 
 		return openssl_pkey_get_public($material);
@@ -309,24 +391,51 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	protected function loadPrivateKey(string $material): \OpenSSLAsymmetricKey|false
 	{
 		if ($this->_padding === TWebhookPadding::Pss) {
-			return $this->pssKey($material, $this->_algorithm, $this->getSaltLength(), true);
+			return $this->pssKey($material, $this->pssDigest(), $this->getSaltLength(), true);
 		}
 
 		return openssl_pkey_get_private($material);
 	}
 
 	/**
-	 * @param string $presented the presented signature.
-	 * @return string the signature with {@see getPrefix Prefix} removed.
+	 * Returns the digest a PSS key is built around, after checking it is one PSS can carry.
+	 *
+	 * {@see setAlgorithm Algorithm} accepts whatever OpenSSL can sign with, which is a longer
+	 * list than PSS parameters can name: a PSS key states its hash by object identifier, and
+	 * only the SHA-2 family has one here. Refused as configuration rather than left to
+	 * surface as a `ValueError` from {@see hash}, which a provider would see as a 500.
+	 *
+	 * @throws \Prado\Exceptions\TConfigurationException when the algorithm has no PSS
+	 *   parameters, or PHP's hash extension does not know it.
+	 * @return string the digest name.
+	 * @since 0.2.0
 	 */
-	protected function stripPrefix(string $presented): string
+	protected function pssDigest(): string
 	{
-		$prefix = $this->getPrefix();
-		if ($prefix !== '' && str_starts_with($presented, $prefix)) {
-			return substr($presented, strlen($prefix));
+		if (!in_array($this->_algorithm, hash_algos(), true) || $this->pssParameters($this->_algorithm, 0) === null) {
+			throw new TConfigurationException('webhooks_pss_digest_unsupported', $this->_algorithm, static::class);
 		}
 
-		return $presented;
+		return $this->_algorithm;
+	}
+
+	/**
+	 * Removes {@see getPrefix Prefix} from a presented signature. A value that does not carry
+	 * the configured prefix is not a candidate at all, which is how {@see THmacWebhookSignature}
+	 * treats one: the prefix names the scheme, and a value under another name is not this
+	 * scheme's.
+	 * @param string $presented the presented signature.
+	 * @return null|string the signature with the prefix removed, or null when a prefix is
+	 *   configured and the value does not start with it.
+	 */
+	protected function stripPrefix(string $presented): ?string
+	{
+		$prefix = $this->getPrefix();
+		if ($prefix === '') {
+			return $presented;
+		}
+
+		return str_starts_with($presented, $prefix) ? substr($presented, strlen($prefix)) : null;
 	}
 
 	/**
@@ -499,6 +608,29 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	}
 
 	/**
+	 * @return int the largest certificate body accepted from a fetch, in bytes. Defaults to
+	 *   {@see DEFAULT_CERTIFICATE_MAX_SIZE}.
+	 * @since 0.2.0
+	 */
+	public function getCertificateMaxSize(): int
+	{
+		return $this->_certificateMaxSize;
+	}
+
+	/**
+	 * Bounds the size of a fetched certificate. A PEM certificate is a few kilobytes; a
+	 * response far larger than that is not one, and reading it into memory and handing it
+	 * to OpenSSL is work an attacker who controls the URL's host should not be able to
+	 * order.
+	 * @param mixed $value the size limit in bytes; less than 1 is read as 1.
+	 * @since 0.2.0
+	 */
+	public function setCertificateMaxSize($value): void
+	{
+		$this->_certificateMaxSize = max(1, TPropertyValue::ensureInteger($value));
+	}
+
+	/**
 	 * @return \Belisoful\Prado\Web\Webhooks\TWebhookPadding how an RSA signature is
 	 *   padded. Defaults to
 	 *   {@see \Belisoful\Prado\Web\Webhooks\TWebhookPadding::Pkcs1}.
@@ -522,12 +654,22 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	}
 
 	/**
+	 * @throws \Prado\Exceptions\TConfigurationException when the salt follows the digest and
+	 *   the digest is one PSS cannot carry, such as an OpenSSL name PHP's hash extension does
+	 *   not know.
 	 * @return int the PSS salt length in bytes. Defaults to the digest length, which is the
 	 *   usual convention; RFC 9421 fixes it at 64 for its `rsa-pss-sha512`.
 	 */
 	public function getSaltLength(): int
 	{
-		return $this->_saltLength > 0 ? $this->_saltLength : strlen(hash($this->_algorithm, '', true));
+		if ($this->_saltLength > 0) {
+			return $this->_saltLength;
+		}
+		if (!in_array($this->_algorithm, hash_algos(), true)) {
+			throw new TConfigurationException('webhooks_pss_digest_unsupported', $this->_algorithm, static::class);
+		}
+
+		return strlen(hash($this->_algorithm, '', true));
 	}
 
 	/**

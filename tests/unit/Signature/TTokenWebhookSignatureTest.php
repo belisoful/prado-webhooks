@@ -134,6 +134,13 @@ class TTokenWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		(new TTokenWebhookSignature())->verify($this->request(['Authorization' => 'Bearer anything']));
 	}
 
+	public function testVerifyingWithoutATokenIsAConfigurationErrorEvenWhenNoHeaderIsPresented()
+	{
+		// A verifier with no token must not degrade into one that quietly refuses everything.
+		$this->expectException(TConfigurationException::class);
+		(new TTokenWebhookSignature())->verify($this->request());
+	}
+
 	public function testSigningWithoutATokenIsAConfigurationError()
 	{
 		$this->expectException(TConfigurationException::class);

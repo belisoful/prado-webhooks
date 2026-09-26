@@ -158,6 +158,112 @@ class TWebhookDerTest extends PHPUnit\Framework\TestCase
 		$this->assertNull($this->_der->rewrite((string) $private, 'sha256', 32, false));
 	}
 
+	/**
+	 * Unwraps a PKCS#8 PrivateKeyInfo to the PKCS#1 RSAPrivateKey inside it, which is what
+	 * OpenSSL 1.1 exports and OpenSSL 3 does not, so the test does not depend on which one
+	 * is underneath.
+	 * @return array{0: string, 1: string} the PKCS#1 private PEM and the PKCS#1 public PEM.
+	 */
+	private function pkcs1KeyPair(): array
+	{
+		$key = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
+		openssl_pkey_export($key, $pkcs8);
+		$der = base64_decode((string) preg_replace('/-----[^-]+-----|\s+/', '', (string) $pkcs8), true);
+		$outer = $this->_der->read($der);
+		$version = $this->_der->read($outer[1], 0);
+		$algorithm = $this->_der->read($outer[1], $version[2]);
+		$material = $this->_der->read($outer[1], $algorithm[2]);
+		$this->assertSame(0x04, $material[0], 'the exported key is PKCS#8');
+
+		$private = "-----BEGIN RSA PRIVATE KEY-----\n" . chunk_split(base64_encode($material[1]), 64, "\n") . "-----END RSA PRIVATE KEY-----\n";
+
+		// RSAPublicKey is the SEQUENCE { n, e } inside the SubjectPublicKeyInfo's BIT STRING.
+		$spki = base64_decode((string) preg_replace('/-----[^-]+-----|\s+/', '', openssl_pkey_get_details($key)['key']), true);
+		$outer = $this->_der->read($spki);
+		$algorithm = $this->_der->read($outer[1], 0);
+		$bits = $this->_der->read($outer[1], $algorithm[2]);
+		$public = "-----BEGIN RSA PUBLIC KEY-----\n" . chunk_split(base64_encode(substr($bits[1], 1)), 64, "\n") . "-----END RSA PUBLIC KEY-----\n";
+
+		return [$private, $public];
+	}
+
+	public function testAPkcs1PrivateKeyIsWrappedRatherThanRefused()
+	{
+		// On OpenSSL 1.1 the normalized export is PKCS#1, and the rewrite used to require
+		// PKCS#8; a PSS signer on that platform refused every key.
+		[$private, $public] = $this->pkcs1KeyPair();
+
+		$rewrittenPrivate = $this->_der->rewrite($private, 'sha256', 32, true);
+		$this->assertNotNull($rewrittenPrivate);
+		$this->assertStringStartsWith('-----BEGIN PRIVATE KEY-----', $rewrittenPrivate);
+		$privateKey = openssl_pkey_get_private($rewrittenPrivate);
+		$this->assertNotFalse($privateKey, 'OpenSSL reads the wrapped key');
+
+		$rewrittenPublic = $this->_der->rewrite($public, 'sha256', 32, false);
+		$this->assertNotNull($rewrittenPublic);
+		$publicKey = openssl_pkey_get_public($rewrittenPublic);
+		$this->assertNotFalse($publicKey);
+
+		// And the two are PSS keys: they sign and verify each other, with PSS padding.
+		$signature = '';
+		$this->assertTrue(openssl_sign('payload', $signature, $privateKey, 'sha256'));
+		$this->assertSame(1, openssl_verify('payload', $signature, $publicKey, 'sha256'));
+		$this->assertSame(0, openssl_verify('other', $signature, $publicKey, 'sha256'));
+
+		// Against the PKCS#8 rewrite of the same key material, which is the same PSS key.
+		$pkcs8Public = openssl_pkey_get_details(openssl_pkey_get_private($private))['key'];
+		$viaPkcs8 = openssl_pkey_get_public((string) $this->_der->rewrite($pkcs8Public, 'sha256', 32, false));
+		$this->assertSame(1, openssl_verify('payload', $signature, $viaPkcs8, 'sha256'));
+	}
+
+	public function testAPkcs1KeyHandedToThePublicKeySchemeRoundTripsUnderPss()
+	{
+		[$private, $public] = $this->pkcs1KeyPair();
+
+		$signer = new \Belisoful\Prado\Web\Webhooks\Signature\TPublicKeyWebhookSignature();
+		$signer->setHeader('X-Signature');
+		$signer->setPadding('pss');
+		$signer->setPrivateKey($private);
+
+		$verifier = new \Belisoful\Prado\Web\Webhooks\Signature\TPublicKeyWebhookSignature();
+		$verifier->setHeader('X-Signature');
+		$verifier->setPadding('pss');
+		$verifier->setPublicKey($public);
+
+		$request = new \Belisoful\Prado\Web\Webhooks\TWebhookRequest('POST', '{"a":1}');
+		$headers = $signer->sign($request);
+		$this->assertTrue($verifier->verify($request->withHeaders($headers)));
+		$this->assertFalse($verifier->verify($request->withHeaders($headers)->withBody('{"a":2}')));
+	}
+
+	public function testAPkcs8PrivateKeyIsNotMistakenForAPkcs1PublicKey()
+	{
+		// Both open with an INTEGER; only the shape of what follows tells them apart.
+		$key = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
+		openssl_pkey_export($key, $pkcs8);
+
+		$this->assertNull($this->_der->rewrite((string) $pkcs8, 'sha256', 32, false));
+	}
+
+	public function testAPkcs1PublicKeyIsNotMistakenForAPrivateOne()
+	{
+		[, $public] = $this->pkcs1KeyPair();
+
+		$this->assertNull($this->_der->rewrite($public, 'sha256', 32, true));
+	}
+
+	public function testASequenceOfIntegersThatIsNotAKeyIsRefused()
+	{
+		$two = "-----BEGIN RSA PRIVATE KEY-----\n" . base64_encode("\x30\x06\x02\x01\x00\x02\x01\x03") . "\n-----END RSA PRIVATE KEY-----";
+		$this->assertNull($this->_der->rewrite($two, 'sha256', 32, true), 'too few integers for a private key');
+
+		$mixed = "-----BEGIN RSA PUBLIC KEY-----\n" . base64_encode("\x30\x06\x02\x01\x00\x04\x01\x03") . "\n-----END RSA PUBLIC KEY-----";
+		$this->assertNull($this->_der->rewrite($mixed, 'sha256', 32, false), 'not all integers');
+
+		$three = "-----BEGIN RSA PUBLIC KEY-----\n" . base64_encode("\x30\x09\x02\x01\x00\x02\x01\x03\x02\x01\x05") . "\n-----END RSA PUBLIC KEY-----";
+		$this->assertNull($this->_der->rewrite($three, 'sha256', 32, false), 'too many integers for a public key');
+	}
+
 	public function testNormalizingRefusesKeysThatAreNotRsa()
 	{
 		$ec = openssl_pkey_new(['private_key_type' => OPENSSL_KEYTYPE_EC, 'curve_name' => 'prime256v1']);

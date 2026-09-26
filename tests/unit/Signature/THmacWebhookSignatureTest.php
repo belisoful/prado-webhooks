@@ -557,4 +557,22 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$this->expectException(TConfigurationException::class);
 		(new THmacWebhookSignature())->verify($this->request(['X-Webhook-Signature' => 'abc']));
 	}
+
+	public function testVerifyingWithoutASecretIsAConfigurationErrorEvenWhenNoHeaderIsPresented()
+	{
+		// The same, for a request carrying no signature at all: the configuration is what is
+		// wrong, and it is wrong before the request is looked at.
+		$this->expectException(TConfigurationException::class);
+		(new THmacWebhookSignature())->verify($this->request());
+	}
+
+	public function testASecretThatWillNotDecodeIsAConfigurationErrorEvenWhenNoHeaderIsPresented()
+	{
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('!!!not base64!!!');
+		$signature->setSecretEncoding('base64');
+
+		$this->expectException(TConfigurationException::class);
+		$signature->verify($this->request());
+	}
 }
