@@ -126,6 +126,15 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 */
 	public function verify(TWebhookRequest $request): bool
 	{
+		// Configuration first, so a scheme with nothing to verify against fails as
+		// configuration for every request rather than only for the ones that carry every
+		// header; then presence, so an unsigned request costs no body hash.
+		if ($this->configuredKey() === null) {
+			$this->requireCertificateConfiguration($request);
+		}
+		if ($this->presentedSignatures($request) === []) {
+			return false;
+		}
 		if (!$this->bodyHashHolds($request)) {
 			return false;
 		}

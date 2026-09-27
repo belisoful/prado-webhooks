@@ -75,7 +75,7 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 	 * no query string or fragment, which is what Amazon's own validator requires.
 	 * @var string
 	 */
-	public const DEFAULT_CERTIFICATE_URL_PATTERN = '#^https://sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/[^?\#]+\.pem$#';
+	public const DEFAULT_CERTIFICATE_URL_PATTERN = '#^https://sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/[^?\#]+\.pem$#D';
 
 	/** @var array<string, string[]> the fields each message type signs, in the order it signs them. */
 	public const SIGNED_FIELDS = [

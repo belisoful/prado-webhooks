@@ -1216,4 +1216,47 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$this->expectException(TConfigurationException::class);
 		(new THttpMessageWebhookSignature())->verify($this->request());
 	}
+
+	public function testWithAMixedListAKeyOfAnotherKindIsRefusedNotAnError()
+	{
+		// An EC key is configured and three families are allowed. A message declaring an
+		// RSA algorithm is the sender's choice of a key it cannot have; that is a refusal,
+		// not an exception the sender picked.
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('ecdsa-p256-sha256, rsa-pss-sha512, rsa-v1_5-sha256');
+		$verifier->setPublicKey(self::$p256['public']);
+		$verifier->setMaxAge(0);
+
+		foreach (['rsa-pss-sha512', 'rsa-v1_5-sha256'] as $declared) {
+			$headers = $this->headersWithParameters(';created=' . time() . ';alg="' . $declared . '"');
+			$this->assertFalse($verifier->verify($this->request($headers)), $declared);
+		}
+
+		$signer = new THttpMessageWebhookSignature();
+		$signer->setAlgorithms('ecdsa-p256-sha256');
+		$signer->setPrivateKey(self::$p256['private']);
+		$this->assertTrue($verifier->verify($this->signed($signer)));
+	}
+
+	public function testWithAMixedListAnEd25519DeclarationAgainstAPemKeyIsRefusedNotAnError()
+	{
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('rsa-v1_5-sha256, ed25519');
+		$verifier->setPublicKey(self::$rsa['public']);
+		$verifier->setMaxAge(0);
+
+		$headers = $this->headersWithParameters(';created=' . time() . ';alg="ed25519"');
+		$this->assertFalse($verifier->verify($this->request($headers)));
+	}
+
+	public function testAKeyNoAllowedAlgorithmCanUseIsStillAConfigurationError()
+	{
+		// The list is RSA-only and the key is EC: unusable whichever the sender declares.
+		$verifier = new THttpMessageWebhookSignature();
+		$verifier->setAlgorithms('rsa-v1_5-sha256, rsa-pss-sha512');
+		$verifier->setPublicKey(self::$p256['public']);
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="rsa-v1_5-sha256"')));
+	}
 }

@@ -158,7 +158,7 @@ class TWebhookSender extends TApplicationComponent
 		$body = $this->encodePayload($payload, $target->getContentType());
 		$delivery = new TWebhookDelivery($target, $id, $payload, $body, $event);
 		$delivery->setHeaders(
-			$target->buildHeaders($event, $id) + [THttpHeaderName::UserAgent => $this->getUserAgent()]
+			self::withDefaultHeader($target->buildHeaders($event, $id), THttpHeaderName::UserAgent, $this->getUserAgent())
 		);
 
 		$this->onSending($delivery);
@@ -283,7 +283,7 @@ class TWebhookSender extends TApplicationComponent
 		// header, and reads it from here under the same IdName -- so a fielded scheme with
 		// an IdField needs an IdName as well, or its packed id is minted per attempt.
 		if ($signer instanceof TWebhookSignature && ($idName = $signer->getIdName()) !== null) {
-			$headers += [$idName => $delivery->getID()];
+			$headers = self::withDefaultHeader($headers, $idName, $delivery->getID());
 		}
 
 		// The signer is shown the whole outbound request, not just the body, because the
@@ -326,10 +326,40 @@ class TWebhookSender extends TApplicationComponent
 	}
 
 	/**
+	 * Adds a header unless one by that name, in any case, is already present.
+	 *
+	 * Header names are case-insensitive on the wire, and {@see TWebhookTarget::buildHeaders}
+	 * merges a target's own that way; a `+` here would send `user-agent` and `User-Agent`
+	 * both.
+	 *
+	 * @param array<string, string> $headers the headers so far.
+	 * @param string $name the header to add.
+	 * @param string $value its value.
+	 * @return array<string, string> the headers, with the addition when none matched.
+	 */
+	protected static function withDefaultHeader(array $headers, string $name, string $value): array
+	{
+		foreach (array_keys($headers) as $present) {
+			if (strcasecmp((string) $present, $name) === 0) {
+				return $headers;
+			}
+		}
+		$headers[$name] = $value;
+
+		return $headers;
+	}
+
+	/**
+	 * Says whether a status is one worth attempting again.
+	 *
+	 * Public so the queue can apply the same policy across hours that this class applies
+	 * across seconds: a delivery refused with a 4xx is not sent again from either.
+	 *
 	 * @param int $statusCode the status the target answered with.
 	 * @return bool whether the delivery is worth attempting again.
+	 * @since 0.1.0
 	 */
-	protected function isRetryable(int $statusCode): bool
+	public function isRetryable(int $statusCode): bool
 	{
 		return in_array($statusCode, $this->_retryStatusCodes, true);
 	}
@@ -370,7 +400,16 @@ class TWebhookSender extends TApplicationComponent
 		}
 		$header = trim($header);
 		if (is_numeric($header)) {
-			return max(0, (int) ((float) $header * 1000));
+			// A float past the int range casts to something platform-defined -- 0 on x86-64
+			// -- which would turn "wait forever" into "retry now". Saturate instead; every
+			// caller caps the result anyway. The threshold leaves the product well inside
+			// the range, since a float this close to PHP_INT_MAX rounds to just past it.
+			$seconds = (float) $header;
+			if ($seconds >= PHP_INT_MAX / 2000) {
+				return PHP_INT_MAX;
+			}
+
+			return max(0, (int) ($seconds * 1000));
 		}
 		$at = strtotime($header);
 		if ($at === false) {

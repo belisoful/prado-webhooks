@@ -193,9 +193,11 @@ with no key — does not take the rest of the batch with it. It uses up its atte
 other failure and settles as a `failed` row with the reason on it.
 
 One attempt is made per drain: the queue owns the retry cadence, doubling from
-`QueueRetryDelay` up to `QueueMaxRetryDelay`, for up to `QueueMaxAttempts`. Deliveries that
-run out of attempts are kept as `failed` rows to be looked at and replayed, until the prune
-task removes them; accepted ones are deleted unless `KeepDelivered` is on.
+`QueueRetryDelay` up to `QueueMaxRetryDelay`, for up to `QueueMaxAttempts`. The retry policy
+is the sender's: a status outside `RetryStatusCodes` -- a 4xx -- settles the delivery as
+`failed` on the spot rather than sending it again for hours. Deliveries that run out of
+attempts are kept as `failed` rows to be looked at and replayed, until the prune task
+removes them; accepted ones are deleted unless `KeepDelivered` is on.
 
 **Secrets and the queue table.** A target holds a signer, and a signer holds a key, which is
 not something to write into a table. Two ways, and pick one deliberately:

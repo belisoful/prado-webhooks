@@ -107,6 +107,18 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 		'ed25519' => ['type' => 'ed25519'],
 	];
 
+	/**
+	 * The kind of public key each algorithm type verifies with, as {@see publicKeyKind}
+	 * reports it.
+	 * @var array<string, string>
+	 */
+	protected const KEY_KINDS = [
+		'rsa' => 'rsa',
+		'pss' => 'rsa',
+		'ecdsa' => 'ec',
+		'ed25519' => 'ed25519',
+	];
+
 	/** @var array<string, string> the digest names RFC 9530 uses, and their PHP algorithms. */
 	public const DIGEST_ALGORITHMS = ['sha-256' => 'sha256', 'sha-512' => 'sha512'];
 
@@ -898,6 +910,53 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	}
 
 	/**
+	 * Whether some algorithm in {@see getAlgorithms Algorithms} verifies with a key of a kind.
+	 * @param string $kind a kind as {@see publicKeyKind} reports it.
+	 * @return bool whether an allowed algorithm takes that kind of key.
+	 * @since 0.1.0
+	 */
+	protected function keyKindIsAllowed(string $kind): bool
+	{
+		foreach ($this->_algorithms as $allowed) {
+			$type = self::ALGORITHMS[$allowed]['type'];
+			if ($type !== 'hmac' && self::KEY_KINDS[$type] === $kind) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Reads what kind of key {@see getPublicKey PublicKey} holds.
+	 *
+	 * An Ed25519 key is 32 raw bytes in base64, which no PEM decodes to; anything else is
+	 * handed to OpenSSL and named by its type.
+	 *
+	 * @return null|string `rsa`, `ec` or `ed25519`, or null when the material is none of
+	 *   them.
+	 * @since 0.1.0
+	 */
+	protected function publicKeyKind(): ?string
+	{
+		$raw = base64_decode($this->_publicKey, true);
+		if ($raw !== false && strlen($raw) === 32) {
+			return 'ed25519';
+		}
+		$key = openssl_pkey_get_public($this->readKeyMaterial($this->_publicKey));
+		if ($key === false) {
+			return null;
+		}
+		$details = openssl_pkey_get_details($key);
+
+		return match ($details['type'] ?? null) {
+			OPENSSL_KEYTYPE_RSA => 'rsa',
+			OPENSSL_KEYTYPE_EC => 'ec',
+			default => null,
+		};
+	}
+
+	/**
 	 * Requires that at least one allowed algorithm has key material to verify with.
 	 * @throws \Prado\Exceptions\TConfigurationException when none does.
 	 * @since 0.1.0
@@ -947,10 +1006,25 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 		if ($specification['type'] === 'hmac') {
 			return hash_equals(hash_hmac($specification['digest'], $base, $this->getSecretKey(), true), $signature);
 		}
+		// The key that is configured is one kind; the message may declare any algorithm in
+		// the list. When the key serves another allowed algorithm, declaring this one is the
+		// sender's choice, and refused; a key no allowed algorithm could use is a
+		// configuration error whichever the sender declared.
+		$kind = $this->publicKeyKind();
+		if ($kind !== self::KEY_KINDS[$specification['type']]) {
+			if ($kind !== null && $this->keyKindIsAllowed($kind)) {
+				return false;
+			}
+			throw new TConfigurationException(
+				$specification['type'] === 'pss' ? 'webhooks_pss_key_invalid' : 'webhooks_key_invalid',
+				'PublicKey',
+				static::class
+			);
+		}
 		if ($specification['type'] === 'ed25519') {
-			$key = $this->rawKey($this->_publicKey, 'PublicKey', SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES);
+			$key = $this->rawKey($this->_publicKey, 'PublicKey', 32);
 
-			return strlen($signature) === SODIUM_CRYPTO_SIGN_BYTES
+			return strlen($signature) === 64
 				&& sodium_crypto_sign_verify_detached($signature, $base, $key);
 		}
 
@@ -993,7 +1067,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 		if ($specification['type'] === 'ed25519') {
 			return sodium_crypto_sign_detached(
 				$base,
-				$this->rawKey($this->_privateKey, 'PrivateKey', SODIUM_CRYPTO_SIGN_SECRETKEYBYTES)
+				$this->rawKey($this->_privateKey, 'PrivateKey', 64)
 			);
 		}
 
@@ -1125,6 +1199,11 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 		}
 		foreach ($algorithms as $algorithm) {
 			if (!isset(self::ALGORITHMS[$algorithm])) {
+				throw new TConfigurationException('webhooks_algorithm_unsupported', $algorithm, static::class);
+			}
+			// Refused here rather than on the first message declaring it, which would let
+			// a sender pick the error page.
+			if ($algorithm === 'ed25519' && !function_exists('sodium_crypto_sign_verify_detached')) {
 				throw new TConfigurationException('webhooks_algorithm_unsupported', $algorithm, static::class);
 			}
 		}

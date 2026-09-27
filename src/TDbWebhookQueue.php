@@ -521,9 +521,15 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 		$db = $this->getDbConnection();
 		$driver = $db->getDriverName();
 		$key = 'INTEGER PRIMARY KEY';
+		// TEXT is unbounded on SQLite and PostgreSQL and 64 KiB on MySQL, where a larger
+		// payload is either refused or, without strict mode, cut and later decoded as null.
+		// The time columns are Unix seconds; INTEGER is 32 bits on MySQL and PostgreSQL,
+		// which a lease or backoff written past 2038 would overflow.
+		$text = 'TEXT';
 		$options = '';
 		if ($driver === TDbDriver::DRIVER_MYSQL) {
 			$key = 'INTEGER PRIMARY KEY AUTO_INCREMENT';
+			$text = 'MEDIUMTEXT';
 			$options = ' DEFAULT CHARSET=utf8mb4';
 		} elseif ($driver === TDbDriver::DRIVER_SQLITE) {
 			$key = 'INTEGER PRIMARY KEY AUTOINCREMENT';
@@ -536,17 +542,17 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 			tabuid ' . $key . ',
 			deliveryid VARCHAR(64) NOT NULL,
 			eventname VARCHAR(190) NULL,
-			targetspec TEXT NOT NULL,
-			payload TEXT NULL,
+			targetspec ' . $text . ' NOT NULL,
+			payload ' . $text . ' NULL,
 			status VARCHAR(16) NOT NULL,
 			attempts INTEGER NOT NULL DEFAULT 0,
 			maxattempts INTEGER NOT NULL DEFAULT 0,
-			nextattempt INTEGER NOT NULL DEFAULT 0,
-			leaseduntil INTEGER NOT NULL DEFAULT 0,
+			nextattempt BIGINT NOT NULL DEFAULT 0,
+			leaseduntil BIGINT NOT NULL DEFAULT 0,
 			leasetoken VARCHAR(64) NULL,
 			laststatus VARCHAR(190) NULL,
-			createdtime INTEGER NOT NULL,
-			updatedtime INTEGER NOT NULL
+			createdtime BIGINT NOT NULL,
+			updatedtime BIGINT NOT NULL
 			)' . $options
 		)->execute();
 

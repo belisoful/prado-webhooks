@@ -563,4 +563,11 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 		$verifier->setMaxAge(300);
 		$this->assertFalse($verifier->verify($this->request($message)));
 	}
+
+	public function testTheDefaultCertificatePatternDoesNotMatchBeforeATrailingNewline()
+	{
+		// `$` without D matches before a final newline, and the URL is what gets fetched.
+		$this->assertSame(1, preg_match(TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN, 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem'));
+		$this->assertSame(0, preg_match(TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN, "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem\n"));
+	}
 }

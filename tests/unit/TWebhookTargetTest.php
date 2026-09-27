@@ -383,4 +383,32 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 			$this->assertStringNotContainsString('at least one', $e->getMessage(), 'not the endpoint\'s message');
 		}
 	}
+
+	public function testASpecificationCannotReplaceTheUrlValidator()
+	{
+		// The validator is process-wide; a row that could name it could switch it off for
+		// every target built after it.
+		$refused = 0;
+		TWebhookTarget::setUrlValidator(static function () use (&$refused): bool {
+			$refused++;
+
+			return false;
+		});
+		try {
+			foreach (['urlValidator', 'UrlValidator', 'urlvalidator'] as $key) {
+				try {
+					TWebhookTarget::ensure([$key => 'is_string', 'url' => self::URL]);
+					$this->fail("'$key' should be refused");
+				} catch (TConfigurationException $e) {
+					$this->assertStringContainsString("'$key'", $e->getMessage());
+				}
+			}
+			$this->assertNotSame('is_string', TWebhookTarget::getUrlValidator());
+
+			$this->expectException(TConfigurationException::class);
+			TWebhookTarget::ensure(self::URL);
+		} finally {
+			TWebhookTarget::setUrlValidator(null);
+		}
+	}
 }

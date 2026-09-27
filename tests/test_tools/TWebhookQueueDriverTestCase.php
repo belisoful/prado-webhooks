@@ -695,4 +695,16 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 
 		$queue->setConnectionID('');
 		$this->assertNull($queue->getConnectionID());
-	}}
+	}
+
+	public function testAPayloadLargerThanSixtyFourKilobytesSurvivesTheRoundTrip()
+	{
+		// MySQL's TEXT is 64 KiB; a larger body was refused there, or without strict mode
+		// cut and decoded back as null, and then sent as the body `null`, signed.
+		$payload = ['blob' => str_repeat('x', 70000)];
+		$item = $this->item('https://example.com/hook', $payload);
+		$this->_queue->enqueue($item);
+
+		$this->assertSame($payload, $this->_queue->claim(1, 60)[0]->getPayload());
+	}
+}

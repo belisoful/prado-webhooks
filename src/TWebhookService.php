@@ -125,7 +125,8 @@ class TWebhookService extends TService
 	 */
 	public function run(): void
 	{
-		$endpoint = $this->resolveEndpoint($this->getServiceParameter());
+		$id = $this->getServiceParameter();
+		$endpoint = $id === null ? null : $this->resolveEndpoint($id);
 		if ($endpoint === null) {
 			$this->getResponse()->setStatusCode(404);
 
@@ -259,11 +260,19 @@ class TWebhookService extends TService
 	}
 
 	/**
-	 * @return string the service parameter, which names the endpoint the request is for.
+	 * Returns the service parameter, which names the endpoint the request is for.
+	 *
+	 * The framework hands the parameter over as it was parsed, so `?webhook[]=x` arrives as
+	 * an array. Casting that would warn, and the warning would be a 500 anyone can cause;
+	 * it reads as null here, which no endpoint matches.
+	 *
+	 * @return null|string the service parameter, or null when it is not a single value.
 	 */
-	protected function getServiceParameter(): string
+	protected function getServiceParameter(): ?string
 	{
-		return (string) $this->getRequest()->getServiceParameter();
+		$value = $this->getRequest()->getServiceParameter();
+
+		return is_scalar($value) ? (string) $value : null;
 	}
 
 	/**

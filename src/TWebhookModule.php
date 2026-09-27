@@ -437,7 +437,10 @@ class TWebhookModule extends TPluginModule
 	 * Writes back what one attempt did to a queued delivery.
 	 *
 	 * A failed attempt goes back with the computed backoff -- unless the receiver said when
-	 * to come back. A `Retry-After` on the response is honored in place of the backoff, up
+	 * to come back, or answered with a status the sender's
+	 * {@see TWebhookSender::getRetryStatusCodes RetryStatusCodes} does not retry, in which
+	 * case the delivery is abandoned as it would be inline. A `Retry-After` on the response
+	 * is honored in place of the backoff, up
 	 * to {@see getQueueMaxRetryDelay QueueMaxRetryDelay}: a receiver answering 429 with one
 	 * has said exactly when trying again stops being a waste.
 	 *
@@ -455,6 +458,15 @@ class TWebhookModule extends TPluginModule
 		if ($delivery->getCancel()) {
 			// A handler called it off, which is a decision rather than a failure to retry.
 			$item->setLastStatus('cancelled');
+			$queue->abandon($item);
+
+			return;
+		}
+		$response = $delivery->getResponse();
+		if ($response !== null && !$this->getSender()->isRetryable($response->getStatusCode())) {
+			// The receiver answered, and with a status the sender's own policy does not
+			// retry: a 4xx is a refusal, and ten more copies of it over ten hours would
+			// only cost both ends.
 			$queue->abandon($item);
 
 			return;

@@ -138,18 +138,25 @@ class TWebhookEndpoint extends TApplicationComponent
 	 *
 	 * The only child is `signature`, and a `signatrue` would otherwise be ignored -- which
 	 * leaves an endpoint that accepts everything and reports it verified. Fail at boot
-	 * instead.
+	 * instead. A second `signature` element is refused too: only the first would be built,
+	 * and an operator who meant to layer two schemes would have the weaker one alone.
+	 * {@see \Belisoful\Prado\Web\Webhooks\Signature\TAllWebhookSignature} is how to require
+	 * both.
 	 *
 	 * @param mixed $config the endpoint's configuration.
-	 * @throws \Prado\Exceptions\TConfigurationException when an unknown child is present.
+	 * @throws \Prado\Exceptions\TConfigurationException when an unknown child is present, or
+	 *   the signature child is repeated.
 	 */
 	protected function assertKnownChildren(mixed $config): void
 	{
 		$unknown = [];
 		if ($config instanceof TXmlElement) {
+			$signatures = 0;
 			foreach ($config->getElements() as $element) {
 				if ($element->getTagName() !== self::SIGNATURE_TAG) {
 					$unknown[] = $element->getTagName();
+				} elseif (++$signatures > 1) {
+					throw new TConfigurationException('webhooks_child_duplicate', self::SIGNATURE_TAG, static::class);
 				}
 			}
 		} elseif (is_array($config)) {

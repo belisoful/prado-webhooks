@@ -973,4 +973,39 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$this->assertNull($module->getQueueID());
 		$this->assertFalse($module->getHasQueue());
 	}
+
+	public function testAStatusTheSenderWouldNotRetryAbandonsTheQueuedDelivery()
+	{
+		// A 410 is a receiver saying never; ten more signed copies over ten hours would
+		// only cost both ends. The queue applies the sender's own policy.
+		$this->answer(new THttpClientResponse(410));
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertCount(1, $this->_queue->abandoned);
+		$this->assertCount(0, $this->_queue->rescheduled);
+	}
+
+	public function testARetryAfterOnARefusedStatusDoesNotEarnARetry()
+	{
+		$this->answer(new THttpClientResponse(400, ['Retry-After' => '30'], ''));
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertCount(1, $this->_queue->abandoned);
+		$this->assertCount(0, $this->_queue->rescheduled);
+	}
+
+	public function testARetryableStatusStillGoesBack()
+	{
+		$this->answer(new THttpClientResponse(503));
+		$this->_module->queue(self::URL, ['id' => 1]);
+
+		$this->_module->drain();
+
+		$this->assertCount(0, $this->_queue->abandoned);
+		$this->assertCount(1, $this->_queue->rescheduled);
+	}
 }

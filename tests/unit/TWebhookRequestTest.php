@@ -153,4 +153,23 @@ class TWebhookRequestTest extends PHPUnit\Framework\TestCase
 		$this->assertSame([], (new TWebhookRequest('POST', '{}', [], 'http:///nohost?a=1'))->getQueryParameters());
 		$this->assertSame([], (new TWebhookRequest('POST', '{}', [], ''))->getQueryParameters());
 	}
+
+	public function testAQueryNestedDeeperThanPhpAllowsReadsAsEmptyRatherThanThrowing()
+	{
+		// parse_str also warns past max_input_nesting_level -- only when display_errors is
+		// off, which is production -- and that warning was a 500 anyone could cause.
+		$depth = (int) ini_get('max_input_nesting_level');
+		$this->assertGreaterThan(0, $depth, 'the test needs a nesting limit to exceed');
+		$query = 'sig=abc&a' . str_repeat('[x]', $depth + 1) . '=1';
+		$request = new TWebhookRequest('POST', '{}', [], 'https://example.com/hook?' . $query);
+
+		$display = ini_set('display_errors', '0');
+		try {
+			$parameters = $request->getQueryParameters();
+		} finally {
+			ini_set('display_errors', (string) $display);
+		}
+
+		$this->assertSame([], $parameters);
+	}
 }

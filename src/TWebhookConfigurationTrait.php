@@ -129,8 +129,16 @@ trait TWebhookConfigurationTrait
 
 	/**
 	 * Returns the single child configuration of one tag, or null when there is none.
+	 *
+	 * A PHP child that is present but not an array -- a class name where the array holding
+	 * one was meant, or a null -- is refused, as the plural forms refuse it. Returning null
+	 * would build the parent without the child, and for an endpoint that child is the
+	 * verifier.
+	 *
 	 * @param mixed $config this component's own configuration.
 	 * @param string $tag the child element name, or array key, to read.
+	 * @throws \Prado\Exceptions\TConfigurationException when a PHP child is present but not
+	 *   an array.
 	 * @return null|array<string, mixed>|\Prado\Xml\TXmlElement the child configuration.
 	 */
 	protected function childConfiguration(mixed $config, string $tag): null|array|TXmlElement
@@ -138,7 +146,11 @@ trait TWebhookConfigurationTrait
 		if ($config instanceof TXmlElement) {
 			return $config->getElementByTagName($tag);
 		}
-		if (is_array($config) && is_array($config[$tag] ?? null)) {
+		if (is_array($config) && array_key_exists($tag, $config)) {
+			if (!is_array($config[$tag])) {
+				throw new TConfigurationException('webhooks_child_invalid', $tag, $tag, static::class);
+			}
+
 			return $config[$tag];
 		}
 

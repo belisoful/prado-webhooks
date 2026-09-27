@@ -4,6 +4,7 @@ webhooks_algorithm_invalid			= '{0}' is not an algorithm this PHP offers.
 webhooks_algorithm_unsupported		= '{0}' is not an algorithm {1} implements.
 webhooks_algorithms_required		= {0} requires at least one algorithm.
 webhooks_certificate_pattern_required	= {0} reads a certificate URL out of the request, so CertificateUrlPattern must allow list the URLs it may fetch.
+webhooks_child_duplicate			= <{0}> appears more than once in {1}; only the first would be read. To require two schemes, nest them in a TAllWebhookSignature.
 webhooks_child_id_required			= {1} requires an 'id' attribute on every <{0}> element, because the id is what a URL names.
 webhooks_child_invalid				= The '{0}' child of <{1}> in {2} is not an array of properties; a child that cannot be built is a typo, not an empty component.
 webhooks_child_unknown				= <{0}> is not a child {1} reads; the only one is <{2}>. A misspelled child would otherwise be ignored, and the endpoint left open.

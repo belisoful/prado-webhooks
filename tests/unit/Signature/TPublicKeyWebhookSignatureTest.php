@@ -878,4 +878,27 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$this->expectException(TConfigurationException::class);
 		$signature->verify($this->request(['X-Signature' => 'abc']));
 	}
+
+	public function testAVerifierWithNothingToVerifyAgainstThrowsForARequestMissingTheBodyHash()
+	{
+		// It returned false for a request without the body-hash header and threw only for
+		// one carrying it, so a misconfigured endpoint saw a stream of forgeries for probes
+		// and an error page for the real provider.
+		$verifier = new TPublicKeyWebhookSignature();
+		$verifier->setHeader('X-Signature');
+		$verifier->setBodyHashName('X-Body-Sha256');
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request(['X-Signature' => 'abc']));
+	}
+
+	public function testAVerifierWithNothingToVerifyAgainstThrowsForARequestMissingTheTimestamp()
+	{
+		$verifier = new TPublicKeyWebhookSignature();
+		$verifier->setHeader('X-Signature');
+		$verifier->setTimestampName('X-Timestamp');
+
+		$this->expectException(TConfigurationException::class);
+		$verifier->verify($this->request(['X-Signature' => 'abc']));
+	}
 }

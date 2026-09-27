@@ -804,4 +804,28 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 
 		$this->assertSame(1, $sender->getMaxAttempts());
 	}
+
+	public function testARetryAfterPastTheIntegerRangeSaturatesRatherThanWrappingToZero()
+	{
+		// (int) of a float outside the range is platform-defined -- 0 on x86-64 -- which
+		// would turn "wait forever" into "retry now".
+		$sender = new TWebhookSender();
+
+		$this->assertSame(PHP_INT_MAX, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => '9223372036854775807'])));
+		$this->assertSame(PHP_INT_MAX, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => '1e30'])));
+		$this->assertSame(4000000000000000000, $sender->parseRetryAfter(new THttpClientResponse(429, ['Retry-After' => '4000000000000000'])));
+	}
+
+	public function testATargetsOwnUserAgentIsNotSentTwiceInAnotherCase()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->send([['url' => self::URL, 'headers' => ['user-agent' => 'Mine/1']]], ['id' => 1]);
+
+		$names = array_filter(
+			array_keys($this->_client->requests[0]['headers']),
+			static fn ($name) => strcasecmp($name, 'User-Agent') === 0
+		);
+		$this->assertSame(['user-agent'], array_values($names));
+		$this->assertSame('Mine/1', $this->_client->requests[0]['headers']['user-agent']);
+	}
 }

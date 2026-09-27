@@ -331,4 +331,13 @@ class TIpWebhookVerifierTest extends PHPUnit\Framework\TestCase
 
 		$this->assertFalse($verifier->verify($this->request('10.0.0.1', ['X-Forwarded-For' => '2001:db8::1:8080'])));
 	}
+
+	public function testAnEmptyArrayClearsTheTrustedProxiesAsAnEmptyStringDoes()
+	{
+		$verifier = $this->verifier();
+		$verifier->setTrustedProxies('10.0.0.0/8');
+		$verifier->setTrustedProxies([]);
+
+		$this->assertSame([], $verifier->getTrustedProxies());
+	}
 }

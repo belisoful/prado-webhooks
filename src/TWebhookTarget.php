@@ -157,6 +157,10 @@ class TWebhookTarget extends TApplicationComponent
 				$signature = new THmacWebhookSignature();
 				$signature->setSecret($value);
 				$target->setSignature($signature);
+			} elseif (strcasecmp((string) $name, 'urlValidator') === 0) {
+				// The validator is the application's guard on every target; a row that could
+				// name it could also switch it off, for every target built after it.
+				throw new TConfigurationException('webhooks_target_property_unknown', (string) $name, static::class);
 			} else {
 				try {
 					$target->setSubproperty((string) $name, $value);

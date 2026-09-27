@@ -229,12 +229,13 @@ class TWebhookRequest extends TComponent
 	 * Returns the parameters of the URL's query string alone.
 	 *
 	 * The URL is the caller's, so the query is bounded before it is parsed: `parse_str`
-	 * warns past `max_input_vars`, PRADO turns the warning into an exception, and an
-	 * exception here would be a 500 that anyone can cause. A query with more pairs than
-	 * the limit reads as empty instead, and a scheme that needed one of them refuses.
+	 * warns past `max_input_vars` and past `max_input_nesting_level`, PRADO turns a warning
+	 * into an exception, and an exception here would be a 500 that anyone can cause. A
+	 * query with more pairs than the limit, or one `parse_str` refuses for any other
+	 * reason, reads as empty instead, and a scheme that needed one of them refuses.
 	 *
-	 * @return array<string, string> the query parameters, or none when there are more than
-	 *   `max_input_vars` of them.
+	 * @return array<string, string> the query parameters, or none when `parse_str` will not
+	 *   read them.
 	 */
 	public function getQueryParameters(): array
 	{
@@ -246,7 +247,11 @@ class TWebhookRequest extends TComponent
 		if ($limit > 0 && count(explode('&', $query)) > $limit) {
 			return [];
 		}
-		parse_str($query, $parameters);
+		try {
+			parse_str($query, $parameters);
+		} catch (\Throwable) {
+			return [];
+		}
 
 		return array_map(static fn ($value) => is_scalar($value) ? (string) $value : '', $parameters);
 	}

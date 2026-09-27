@@ -529,4 +529,34 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 
 		$this->assertSame(204, $this->handle('POST', '{}')->getStatusCode());
 	}
+
+	public function testAPhpSignatureChildThatIsNotAnArrayIsRefused()
+	{
+		// A class name where the array holding one was meant would otherwise build an
+		// endpoint with no verifier, which accepts everything.
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->init(['signature' => THmacWebhookSignature::class]);
+	}
+
+	public function testAPhpSignatureChildThatIsNullIsRefused()
+	{
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->init(['signature' => null]);
+	}
+
+	public function testASecondSignatureElementIsRefusedRatherThanDropped()
+	{
+		// Only the first would be built; an operator who meant to layer two schemes would
+		// have the weaker one alone. TAllWebhookSignature is how to require both.
+		$xml = new TXmlDocument();
+		$xml->loadFromString(
+			'<endpoint id="x">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\TIpWebhookVerifier" Addresses="192.0.2.0/24" />'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" />'
+			. '</endpoint>'
+		);
+
+		$this->expectException(TConfigurationException::class);
+		$this->_endpoint->init($xml);
+	}
 }

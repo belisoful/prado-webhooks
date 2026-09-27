@@ -45,8 +45,10 @@ as changes to a version nobody ran.
   has its work picked up; the guarantee is at-least-once, and the delivery id is stable
   across every attempt so a receiver can deduplicate. Write-backs name the lease, so a runner
   that finishes late cannot disturb the one that took over, and a delivery that cannot be
-  built costs itself an attempt rather than ending the run. The queue is exercised against
-  SQLite, MySQL and PostgreSQL.
+  built costs itself an attempt rather than ending the run. A status the sender's
+  `RetryStatusCodes` does not retry settles a queued delivery as failed at once, as it
+  would inline. The queue is exercised against SQLite, MySQL and PostgreSQL; its time
+  columns are 64-bit and its payload column on MySQL is `MEDIUMTEXT`.
 - `onDequeue`, where an application puts back a target it deliberately did not store --
   queueing a reference rather than a secret keeps keys out of the queue table entirely.
 - `BodyHashName`, which binds a delivery to its body for the schemes whose signed payload

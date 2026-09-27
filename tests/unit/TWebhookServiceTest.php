@@ -114,7 +114,7 @@ class TestWebhookService extends TWebhookService
  */
 class TestFrameworkRequest
 {
-	public string $serviceParameter = 'github';
+	public mixed $serviceParameter = 'github';
 	public string $requestType = 'post';
 	public array $headers = ['X-GitHub-Event' => 'push'];
 	public string $baseUrl = 'https://example.com';
@@ -872,5 +872,25 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 
 		$this->assertSame(['push'], $seen);
 		$this->assertSame(204, $service->response->statusCode);
+	}
+
+	public function testAnArrayServiceParameterIsFourOhFourNotAnErrorPage()
+	{
+		// index.php?webhook[]=x reaches the framework as an array; casting it would warn,
+		// and PRADO turns a warning into an error page anyone could ask for.
+		$service = new TestEnvironmentWebhookService();
+		$endpoint = new TWebhookEndpoint();
+		$endpoint->setID('github');
+		$service->addEndpoint($endpoint);
+		$service->request->serviceParameter = ['x'];
+		$seen = [];
+		$endpoint->onWebhook[] = function () use (&$seen) {
+			$seen[] = true;
+		};
+
+		$service->run();
+
+		$this->assertSame(404, $service->response->statusCode);
+		$this->assertSame([], $seen, 'nor does it fall back to the only endpoint');
 	}
 }

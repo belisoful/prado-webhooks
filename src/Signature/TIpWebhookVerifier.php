@@ -277,7 +277,7 @@ class TIpWebhookVerifier extends TApplicationComponent implements IWebhookVerifi
 	 */
 	public function setTrustedProxies($value): void
 	{
-		$this->_trustedProxies = $value === null || $value === ''
+		$this->_trustedProxies = $value === null || $value === '' || $value === []
 			? []
 			: $this->parseRanges($value, 'TrustedProxies');
 	}
