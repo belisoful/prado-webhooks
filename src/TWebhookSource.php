@@ -31,7 +31,11 @@ enum TWebhookSource: string
 	/** A query string parameter of the request URL. */
 	case Query = 'query';
 
-	/** A parameter of the request: the query string, or the posted form body. */
+	/**
+	 * A field of the posted form body: a scalar entry of `$_POST`, which PHP fills for a
+	 * form-encoded body and leaves empty for JSON. The query string is {@see Query}, not
+	 * here, so a scheme that signs the posted fields does not also sign `?webhook=<id>`.
+	 */
 	case Parameter = 'parameter';
 
 	/**

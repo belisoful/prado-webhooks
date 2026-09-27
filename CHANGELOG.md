@@ -61,6 +61,11 @@ as changes to a version nobody ran.
 - `PayloadFormat`, a template over `{body}`, `{method}`, `{url}`, `{timestamp}`, `{id}`,
   `{crc32}`, `{header:…}`, `{param:…}`, `{query:…}`, `{const:…}` and `{params}`, which is what
   makes the schemes in common use configuration rather than code.
+  `{params}`, `{param:name}` and `Source="parameter"` mean the posted form fields alone,
+  the scalar entries of `$_POST`; the query string stays reachable through `{url}`,
+  `{query:name}` and `Source="query"`. The sender shows a scheme the decoded fields of a
+  form-encoded body as the request parameters, per attempt, so a delivery signed with
+  `{url}{params}` verifies through `TWebhookService` at the other end.
 - `TWebhookEncoding` (raw, hex, base64, base64url, with decoding) and `TWebhookSource`
   (header, query, parameter).
 - Security properties that were written down before the tag rather than after it, and are

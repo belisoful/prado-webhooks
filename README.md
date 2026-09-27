@@ -240,7 +240,7 @@ The schemes are general and configured, not one class per provider.
 | `TPublicKeyWebhookSignature` | an asymmetric signature, PKCS#1 v1.5 or PSS, with a configured key or a certificate the delivery names |
 | `TJwtWebhookSignature` | a JSON Web Token: HS256/384/512, RS256/384/512, ES256/384/512, with claim checks |
 | `THttpMessageWebhookSignature` | HTTP Message Signatures, RFC 9421 — the message lists what it covers |
-| `TTokenWebhookSignature` | a shared secret presented as it is, in a header, the query string, or a parameter |
+| `TTokenWebhookSignature` | a shared secret presented as it is, in a header, the query string, or a posted form field |
 | `TIpWebhookVerifier` | an address allow list, with CIDR and a chain of trusted proxies |
 | `TSnsWebhookVerifier` | Amazon SNS, whose signed string is a canonicalization of the body's own fields |
 | `TAnyWebhookSignature` / `TAllWebhookSignature` | several of the above, for a secret rotation or a layered check |
@@ -260,9 +260,14 @@ an identically configured object.
 | `{method}` `{url}` | the HTTP method, the absolute request URL |
 | `{timestamp}` `{id}` | the timestamp and delivery id the signature is bound to |
 | `{crc32}` | the CRC32 of the body, as a decimal string |
-| `{header:Name}` `{param:name}` `{query:name}` | one header, request parameter, or query parameter |
+| `{header:Name}` `{param:name}` `{query:name}` | one header, posted form field, or query parameter |
 | `{const:NAME}` | one entry of `Constants`, for values that come from your own configuration |
-| `{params}` | every request parameter, sorted by name, as name and value concatenated |
+| `{params}` | every posted form field, sorted by name, as name and value concatenated |
+
+A form field is a scalar entry of the posted body as PHP parses it: `$_POST` when receiving,
+the encoded payload when sending. The query string is never among them — every inbound URL
+carries `?webhook=<id>` there, which no provider signed — and is reached through `{url}`,
+`{query:name}` and `Source="query"` instead.
 
 A scheme whose payload leaves out `{body}` is not bound to the body at all unless something
 else ties them together. `BodyHashName` is that something: it names where the request

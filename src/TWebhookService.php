@@ -238,10 +238,10 @@ class TWebhookService extends TService
 	/**
 	 * Assembles the request a verifier is given.
 	 *
-	 * The URL, the parameters, and the address are collected even though most schemes want
-	 * none of them, because the ones that do -- a signature over the URL, a token in the
-	 * query string, an address allow list -- cannot be configured into an endpoint whose
-	 * request never carried them.
+	 * The URL, the posted form fields, and the address are collected even though most
+	 * schemes want none of them, because the ones that do -- a signature over the URL, a
+	 * token in the query string, an address allow list -- cannot be configured into an
+	 * endpoint whose request never carried them.
 	 *
 	 * @param bool $withBody whether to read the body; false leaves it empty, for a request
 	 *   refused before it is worth reading.
@@ -325,13 +325,21 @@ class TWebhookService extends TService
 	}
 
 	/**
-	 * @return array<string, string> the request parameters, query string and posted form
-	 *   together, as the framework parsed them.
+	 * Returns the posted form fields, which is what `{params}`, `{param:name}` and
+	 * `Source="parameter"` read.
+	 *
+	 * These are the scalar entries of `$_POST` and nothing else. The framework's own view
+	 * of the request merges the query string in, and every inbound URL carries
+	 * `?webhook=<id>` there -- a value no provider signed, so a Twilio-shaped scheme over
+	 * `{url}{params}` would hash it and refuse every delivery. The query string stays
+	 * reachable through `{url}`, `{query:name}` and `Source="query"`.
+	 *
+	 * @return array<string, string> the posted form fields, as PHP parsed them.
 	 */
 	protected function getRequestParameters(): array
 	{
 		$parameters = [];
-		foreach ($this->getRequest()->toArray() as $name => $value) {
+		foreach ($_POST as $name => $value) {
 			if (is_scalar($value)) {
 				$parameters[(string) $name] = (string) $value;
 			}

@@ -190,6 +190,30 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		)));
 	}
 
+	public function testTheQueryStringIsSignedThroughTheUrlAndNotThroughTheParameters()
+	{
+		// Every inbound URL carries ?webhook=<id>, which the provider signed as part of the
+		// URL and nowhere else. The parameters are the posted fields alone, so the service
+		// parameter must not turn up a second time among them.
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret(self::SECRET);
+		$signature->setHeader('X-Signature');
+		$signature->setAlgorithm('sha1');
+		$signature->setEncoding('base64');
+		$signature->setPayloadFormat('{url}{params}');
+
+		$url = 'https://example.com/index.php?webhook=twilio';
+		$fields = ['From' => '+15005550006', 'CallSid' => 'CA123'];
+		$expected = base64_encode(hash_hmac('sha1', $url . 'CallSidCA123From+15005550006', self::SECRET, true));
+
+		$this->assertSame(['X-Signature' => $expected], $signature->sign($this->request([], '', $url, $fields)));
+		$this->assertTrue($signature->verify($this->request(['X-Signature' => $expected], '', $url, $fields)));
+
+		// What the merged view of the request would have produced is a forgery.
+		$merged = base64_encode(hash_hmac('sha1', $url . 'CallSidCA123From+15005550006webhooktwilio', self::SECRET, true));
+		$this->assertFalse($signature->verify($this->request(['X-Signature' => $merged], '', $url, $fields)));
+	}
+
 	public function testParametersAndHeadersCanBeSignedByName()
 	{
 		$signature = new THmacWebhookSignature();

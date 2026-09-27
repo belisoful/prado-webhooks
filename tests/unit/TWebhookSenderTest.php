@@ -2,9 +2,11 @@
 
 use Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature;
 use Belisoful\Prado\Web\Webhooks\TWebhookDelivery;
+use Belisoful\Prado\Web\Webhooks\TWebhookEndpoint;
 use Belisoful\Prado\Web\Webhooks\TWebhookModule;
 use Belisoful\Prado\Web\Webhooks\TWebhookRequest;
 use Belisoful\Prado\Web\Webhooks\TWebhookSender;
+use Belisoful\Prado\Web\Webhooks\TWebhookService;
 use Belisoful\Prado\Web\Webhooks\TWebhookTarget;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidDataValueException;
@@ -54,6 +56,82 @@ class TestWebhookSender extends TWebhookSender
 	public function backoffFor(int $delay, int $attempt): int
 	{
 		return $this->backoff($delay, $attempt);
+	}
+}
+
+/**
+ * Stands in for THttpResponse on the receiving end of a replayed delivery.
+ */
+class TestReplayResponse
+{
+	public int $statusCode = 200;
+
+	public function setStatusCode($value, $reason = null): void
+	{
+		$this->statusCode = (int) $value;
+	}
+
+	public function appendHeader($value): void
+	{
+	}
+
+	public function setContentType($value): void
+	{
+	}
+
+	public function write($value): void
+	{
+	}
+}
+
+/**
+ * The inbound service replaying a request the sender made. Only the readers the command
+ * line cannot supply are replaced; the posted fields come through the service's own reader
+ * of $_POST, which a test fills as PHP would have from the body.
+ */
+class TestReplayWebhookService extends TWebhookService
+{
+	public TestReplayResponse $response;
+
+	public function __construct(private TWebhookRequest $_replayed, private string $_serviceParameter)
+	{
+		$this->response = new TestReplayResponse();
+		parent::__construct();
+	}
+
+	public function getResponse()
+	{
+		return $this->response;
+	}
+
+	protected function getServiceParameter(): string
+	{
+		return $this->_serviceParameter;
+	}
+
+	protected function getRequestMethod(): string
+	{
+		return $this->_replayed->getMethod();
+	}
+
+	protected function getRequestHeaders(): array
+	{
+		return $this->_replayed->getHeaders();
+	}
+
+	protected function readBody(): string
+	{
+		return $this->_replayed->getBody();
+	}
+
+	protected function getRequestUrl(): string
+	{
+		return $this->_replayed->getUrl();
+	}
+
+	protected function getRemoteAddress(): ?string
+	{
+		return '192.0.2.1';
 	}
 }
 
@@ -537,6 +615,162 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 		foreach (array_keys($this->_client->requests) as $index) {
 			$this->assertTrue($signature->verify($this->sent($index)));
 		}
+	}
+
+	/** A Twilio-shaped scheme: SHA-1 over the URL and the sorted posted fields, base64. */
+	private function twilio(string $secret = 'twilio-auth-token'): THmacWebhookSignature
+	{
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret($secret);
+		$signature->setHeader('X-Twilio-Signature');
+		$signature->setAlgorithm('sha1');
+		$signature->setEncoding('base64');
+		$signature->setPayloadFormat('{url}{params}');
+
+		return $signature;
+	}
+
+	public function testAFormEncodedDeliverySignedOverItsFieldsVerifiesThroughTheService()
+	{
+		// What the sender hashes under {params} has to be what a PRADO receiver computes
+		// from $_POST: the decoded fields, sorted, and nothing from the query string the
+		// URL carries -- that is covered once, through {url}.
+		$url = self::URL . '?webhook=twilio';
+		$target = TWebhookTarget::ensure(['url' => $url, 'contentType' => 'application/x-www-form-urlencoded']);
+		$target->setSignature($this->twilio());
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send($target, ['From' => '+15005550006', 'CallSid' => 'CA123', 'Body' => 'a b']);
+
+		$request = $this->_client->requests[0];
+		$this->assertSame('From=%2B15005550006&CallSid=CA123&Body=a+b', $request['body']);
+		$expected = base64_encode(hash_hmac('sha1', $url . 'Bodya bCallSidCA123From+15005550006', 'twilio-auth-token', true));
+		$this->assertSame($expected, $request['headers']['X-Twilio-Signature']);
+
+		// Replayed through the service, with $_POST holding what PHP parses that body into.
+		$saved = $_POST;
+		parse_str((string) $request['body'], $_POST);
+		try {
+			$service = new TestReplayWebhookService($this->sent(), 'twilio');
+			$endpoint = new TWebhookEndpoint();
+			$endpoint->setID('twilio');
+			$endpoint->setRequireJson(false);
+			$endpoint->setVerifier($this->twilio());
+			$service->addEndpoint($endpoint);
+			$accepted = 0;
+			$endpoint->onWebhook[] = function () use (&$accepted) {
+				$accepted++;
+			};
+
+			$service->run();
+
+			$this->assertSame(1, $accepted);
+			$this->assertSame(204, $service->response->statusCode);
+		} finally {
+			$_POST = $saved;
+		}
+	}
+
+	public function testAJsonDeliveryShowsAParameterSigningSchemeNoFields()
+	{
+		// A JSON body parses to nothing in a receiver's $_POST, so {params} is empty there
+		// and is empty here.
+		$this->_sender->setSignature($this->twilio());
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send(self::URL, ['From' => '+15005550006']);
+
+		$expected = base64_encode(hash_hmac('sha1', self::URL, 'twilio-auth-token', true));
+		$this->assertSame($expected, $this->_client->requests[0]['headers']['X-Twilio-Signature']);
+	}
+
+	public function testARewrittenFormBodyIsSignedOverItsNewFieldsAndNestedOnesAreSkipped()
+	{
+		// The fields are decoded from the body as it will be sent, after any handler has
+		// rewritten it; a nested field is skipped, as the receiving side skips it.
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setHeader('X-Signature');
+		$signature->setPayloadFormat('{params}');
+		$target = TWebhookTarget::ensure(['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']);
+		$target->setSignature($signature);
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->onSending[] = function ($sender, TWebhookDelivery $delivery) {
+			$delivery->setBody('b=2&a=1&n%5Bx%5D=3');
+		};
+
+		$this->_sender->send($target, ['id' => 1]);
+
+		$this->assertSame('b=2&a=1&n%5Bx%5D=3', $this->_client->requests[0]['body']);
+		$this->assertSame(hash_hmac('sha256', 'a1b2', 's3cret'), $this->_client->requests[0]['headers']['X-Signature']);
+	}
+
+	public function testTheContentTypeActuallySentDecidesWhetherTheBodyIsAForm()
+	{
+		// A target's own Content-Type header replaces the default, and that is the header
+		// the receiver's PHP parses by; a handler that drops the header leaves the target's
+		// content type to decide.
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setHeader('X-Signature');
+		$signature->setPayloadFormat('{params}');
+		$target = TWebhookTarget::ensure([
+			'url' => self::URL,
+			'headers' => ['content-type' => 'application/x-www-form-urlencoded; charset=utf-8'],
+		]);
+		$target->setSignature($signature);
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send($target, 'a=1&b=2');
+
+		$this->assertSame(hash_hmac('sha256', 'a1b2', 's3cret'), $this->_client->requests[0]['headers']['X-Signature']);
+
+		$this->_sender->onSending[] = function ($sender, TWebhookDelivery $delivery) {
+			$headers = $delivery->getHeaders();
+			unset($headers['content-type']);
+			$delivery->setHeaders($headers);
+		};
+		$this->_sender->send($target, 'a=1&b=2');
+
+		$this->assertArrayNotHasKey('content-type', $this->_client->requests[1]['headers']);
+		$this->assertSame(hash_hmac('sha256', '', 's3cret'), $this->_client->requests[1]['headers']['X-Signature']);
+	}
+
+	public function testAnEmptyFormBodyHasNoFields()
+	{
+		$signature = new THmacWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setHeader('X-Signature');
+		$signature->setPayloadFormat('{params}');
+		$target = TWebhookTarget::ensure(['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']);
+		$target->setSignature($signature);
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send($target, []);
+
+		$this->assertSame('', $this->_client->requests[0]['body']);
+		$this->assertSame(hash_hmac('sha256', '', 's3cret'), $this->_client->requests[0]['headers']['X-Signature']);
+	}
+
+	public function testAFormBodyPastTheInputLimitIsSignedOverNoFields()
+	{
+		// parse_str warns past max_input_vars and the framework turns the warning into an
+		// exception; a receiver truncates such a body at the same limit, so the delivery
+		// could not verify there in any case.
+		$limit = (int) ini_get('max_input_vars');
+		$this->assertGreaterThan(0, $limit, 'the test needs a max_input_vars limit to exceed');
+		$fields = [];
+		for ($i = 0; $i <= $limit; $i++) {
+			$fields["p$i"] = '1';
+		}
+		$target = TWebhookTarget::ensure(['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']);
+		$target->setSignature($this->twilio());
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send($target, $fields);
+
+		$expected = base64_encode(hash_hmac('sha1', self::URL, 'twilio-auth-token', true));
+		$this->assertSame($expected, $this->_client->requests[0]['headers']['X-Twilio-Signature']);
 	}
 
 	public function testEventsAreRaisedForADeliveryThatSucceeds()
