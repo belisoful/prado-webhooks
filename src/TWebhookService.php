@@ -218,7 +218,7 @@ class TWebhookService extends TService
 	/**
 	 * @return null|int the body size the request declares in `Content-Length`, or null
 	 *   when it declares none or something that is not a size.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function getDeclaredBodySize(): ?int
 	{
@@ -365,7 +365,7 @@ class TWebhookService extends TService
 	 * turn a refusal into a success, so the status may be changed only to another refusal.
 	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookEventParameter $param the request and response.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function onRefused(TWebhookEventParameter $param): void
 	{

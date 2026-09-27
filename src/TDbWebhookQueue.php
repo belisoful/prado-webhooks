@@ -186,7 +186,7 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 * @param int $limit how many to find at most.
 	 * @param int $now the runner's clock.
 	 * @return int[] the ids, due first.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function findDue(int $limit, int $now): array
 	{
@@ -218,7 +218,7 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 * @param string $token the lease token.
 	 * @param int $now the runner's clock.
 	 * @param int $until when the lease runs out.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function stampLease(array $due, string $token, int $now, int $until): void
 	{
@@ -240,7 +240,7 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 * The last statement of a claim: reads back what the stamp actually took.
 	 * @param string $token the lease token.
 	 * @return \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem[] the claimed deliveries, due first.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function claimedBy(string $token): array
 	{

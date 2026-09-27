@@ -74,7 +74,7 @@ class TWebhookPruneCronTask extends TCronTask
 	/**
 	 * @return int how many deliveries one run removes at most, or 0 for every one that is
 	 *   old enough. Defaults to 0.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getBatchSize(): int
 	{
@@ -86,7 +86,7 @@ class TWebhookPruneCronTask extends TCronTask
 	 * {@see IWebhookQueue} contract has no limit on {@see IWebhookQueue::prune} -- and any
 	 * other queue removes everything old enough as before.
 	 * @param mixed $value the most one run removes; 0 or less for no bound.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setBatchSize($value): void
 	{

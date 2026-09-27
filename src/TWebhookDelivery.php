@@ -278,7 +278,7 @@ class TWebhookDelivery extends TEventParameter
 	 *   {@see TWebhookSender::getContainHandlerErrors ContainHandlerErrors}), or null when
 	 *   every handler returned. It says nothing about whether the receiver has the delivery;
 	 *   {@see getSuccessful} does.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getHandlerError(): ?string
 	{
@@ -287,7 +287,7 @@ class TWebhookDelivery extends TEventParameter
 
 	/**
 	 * @param mixed $value what a handler threw, or null when none did.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setHandlerError($value): void
 	{

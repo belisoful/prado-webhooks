@@ -114,7 +114,7 @@ class TWebhookEventParameter extends TEventParameter
 	 * body. A body that is not JSON decodes to null rather than failing: whether that is
 	 * acceptable is the endpoint's `RequireJson` decision, not this one.
 	 *
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function decodePayload(): void
 	{
@@ -131,7 +131,7 @@ class TWebhookEventParameter extends TEventParameter
 	/**
 	 * @return bool whether the body has been decoded yet. False for a refused delivery,
 	 *   which is the point: nothing parses a request the endpoint did not accept.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getPayloadDecoded(): bool
 	{
@@ -141,7 +141,7 @@ class TWebhookEventParameter extends TEventParameter
 	/**
 	 * @return bool whether the body is well-formed JSON. Decodes it if nothing has yet. A
 	 *   body holding the literal `null` is JSON; an empty or malformed one is not.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getPayloadIsJson(): bool
 	{
@@ -325,7 +325,7 @@ class TWebhookEventParameter extends TEventParameter
 	/**
 	 * @return bool whether the endpoint accepted the delivery: every check passed and its
 	 *   `onWebhook` was raised. False for a refused one, whatever status a handler set since.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getAccepted(): bool
 	{
@@ -334,7 +334,7 @@ class TWebhookEventParameter extends TEventParameter
 
 	/**
 	 * @param mixed $value whether the endpoint accepted the delivery.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setAccepted($value): void
 	{

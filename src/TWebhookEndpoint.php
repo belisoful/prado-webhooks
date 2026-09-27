@@ -289,7 +289,7 @@ class TWebhookEndpoint extends TApplicationComponent
 	/**
 	 * @return bool whether an endpoint with no verifier is a configuration error. Defaults
 	 *   to false.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getRequireVerifier(): bool
 	{
@@ -301,7 +301,7 @@ class TWebhookEndpoint extends TApplicationComponent
 	 * `signature` child went missing fails at boot -- or, if it was registered from PHP,
 	 * on its first request -- rather than accepting everything.
 	 * @param mixed $value whether a verifier is required.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setRequireVerifier($value): void
 	{

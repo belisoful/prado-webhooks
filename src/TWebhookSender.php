@@ -222,7 +222,7 @@ class TWebhookSender extends TApplicationComponent
 	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookDelivery $delivery the delivery, attempted.
 	 * @throws \Throwable what a handler threw, unless errors are being contained.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function raiseDeliveryEvents(TWebhookDelivery $delivery): void
 	{
@@ -251,7 +251,7 @@ class TWebhookSender extends TApplicationComponent
 	 * @param int $delay the first retry delay in milliseconds.
 	 * @param int $attempt the attempt just made, from 1.
 	 * @return int how long to wait, in milliseconds.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function backoff(int $delay, int $attempt): int
 	{
@@ -360,7 +360,7 @@ class TWebhookSender extends TApplicationComponent
 	 * @param \Prado\IO\HttpClient\THttpClientResponse $response the response.
 	 * @return null|int the delay in milliseconds, at least 0, or null when the header is
 	 *   absent or neither a number nor a date.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function parseRetryAfter(\Prado\IO\HttpClient\THttpClientResponse $response): ?int
 	{
@@ -519,7 +519,7 @@ class TWebhookSender extends TApplicationComponent
 	/**
 	 * @return int the longest wait between attempts, in milliseconds. Defaults to
 	 *   {@see MAX_RETRY_AFTER}.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getMaxRetryDelay(): int
 	{
@@ -531,7 +531,7 @@ class TWebhookSender extends TApplicationComponent
 	 * and what a `Retry-After` is honored for. Deliveries happen inside a request, so this
 	 * is the longest a page ever waits for one target between two attempts.
 	 * @param mixed $value the ceiling in milliseconds; at least 1.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setMaxRetryDelay($value): void
 	{
@@ -541,7 +541,7 @@ class TWebhookSender extends TApplicationComponent
 	/**
 	 * @return bool whether a delivery event handler that throws is recorded on the delivery
 	 *   rather than propagated. Defaults to false.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getContainHandlerErrors(): bool
 	{
@@ -556,7 +556,7 @@ class TWebhookSender extends TApplicationComponent
 	 * length of a run, because the request has already been made by the time a handler runs,
 	 * and an accepted delivery that looked like a failed attempt would be sent again.
 	 * @param mixed $value whether to contain handler errors.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setContainHandlerErrors($value): void
 	{

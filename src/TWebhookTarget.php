@@ -284,7 +284,7 @@ class TWebhookTarget extends TApplicationComponent
 	/**
 	 * @return null|callable the application's say over which URLs may be targets, or null
 	 *   when any absolute `http` or `https` URL may.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public static function getUrlValidator(): ?callable
 	{
@@ -302,7 +302,7 @@ class TWebhookTarget extends TApplicationComponent
 	 *
 	 * @param null|callable $validator the check, taking the URL and returning bool, or null
 	 *   to accept any absolute `http` or `https` URL again.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public static function setUrlValidator(?callable $validator): void
 	{

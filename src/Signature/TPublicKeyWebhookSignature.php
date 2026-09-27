@@ -408,7 +408,7 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 * @throws \Prado\Exceptions\TConfigurationException when the algorithm has no PSS
 	 *   parameters, or PHP's hash extension does not know it.
 	 * @return string the digest name.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function pssDigest(): string
 	{
@@ -610,7 +610,7 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	/**
 	 * @return int the largest certificate body accepted from a fetch, in bytes. Defaults to
 	 *   {@see DEFAULT_CERTIFICATE_MAX_SIZE}.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getCertificateMaxSize(): int
 	{
@@ -623,7 +623,7 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 * to OpenSSL is work an attacker who controls the URL's host should not be able to
 	 * order.
 	 * @param mixed $value the size limit in bytes; less than 1 is read as 1.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setCertificateMaxSize($value): void
 	{

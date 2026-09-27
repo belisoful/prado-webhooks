@@ -200,7 +200,7 @@ trait TWebhookRsaPssTrait
 	 * @param string $body the contents of the outer SEQUENCE.
 	 * @param bool $private whether a private key is expected.
 	 * @return bool whether the body is a PKCS#1 key of the expected kind.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function isPkcs1Body(string $body, bool $private): bool
 	{

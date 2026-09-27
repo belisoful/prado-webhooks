@@ -360,7 +360,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request.
 	 * @param string $name the header name, in any case.
 	 * @return null|string the combined value, or null when the request carries no such header.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function headerValue(TWebhookRequest $request, string $name): ?string
 	{
@@ -389,7 +389,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * @param string $name the parameter name, as the component identifier carries it.
 	 * @return null|string the re-encoded value, or null when the URL does not carry exactly
 	 *   one parameter of that name.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function queryParameterValue(TWebhookRequest $request, string $name): ?string
 	{
@@ -611,7 +611,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * Flattens typed parameters to the text form {@see parseInput} returns.
 	 * @param array<string, array{type: string, value: bool|string}> $typed the parameters.
 	 * @return array<string, string> the parameters as text.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function flattenParameters(array $typed): array
 	{
@@ -629,7 +629,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * @param string $input the value.
 	 * @return array{0: null|string[], 1: array<string, array{type: string, value: bool|string}>}
 	 *   the canonical components, or null, and the typed parameters.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function parseInputTyped(string $input): array
 	{
@@ -683,7 +683,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * @param int $offset where the item starts.
 	 * @return null|array{0: array{type: string, value: bool|string}, 1: int} the typed item
 	 *   and where the text continues, or null when no item starts there.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function parseBareItem(string $input, int $offset): ?array
 	{
@@ -742,7 +742,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 *   parameters, not an error.
 	 * @return null|array{0: array<string, array{type: string, value: bool|string}>, 1: int}
 	 *   the parameters and where the text continues, or null when one is malformed.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function parseParameters(string $input, int $offset): ?array
 	{
@@ -777,7 +777,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * Writes parameters back in RFC 8941 serialization: `;key="value"`, `;flag`.
 	 * @param array<string, array{type: string, value: bool|string}> $parameters the typed parameters.
 	 * @return string the serialization, empty for none.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function serializeParameters(array $parameters): string
 	{
@@ -803,7 +803,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * quoted string, then its parameters.
 	 * @param string $component the canonical component, `name` or `name;key=value`.
 	 * @return string the serialization, `"name";key=value`.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function serializeComponent(string $component): string
 	{
@@ -820,7 +820,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * @param string $component the component, `name` or `name;key=value`.
 	 * @return null|array{0: string, 1: array<string, array{type: string, value: bool|string}>}
 	 *   the name and parameters, or null when the parameters are malformed.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function splitComponent(string $component): ?array
 	{
@@ -844,7 +844,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * @param string $component the component as configured.
 	 * @return string the canonical component; one whose parameters will not parse is kept
 	 *   as written, lower cased, and will match nothing.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function normalizeComponent(string $component): string
 	{
@@ -890,7 +890,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	 * Whether key material is configured for the family an algorithm belongs to.
 	 * @param string $algorithm one of {@see ALGORITHMS}.
 	 * @return bool whether the secret (`hmac-*`) or the public key (everything else) is set.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function hasKeyFor(string $algorithm): bool
 	{
@@ -900,7 +900,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	/**
 	 * Requires that at least one allowed algorithm has key material to verify with.
 	 * @throws \Prado\Exceptions\TConfigurationException when none does.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function requireSomeKey(): void
 	{

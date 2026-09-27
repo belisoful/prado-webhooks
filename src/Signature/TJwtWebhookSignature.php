@@ -182,7 +182,7 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	 *
 	 * @param string $presented the presented value.
 	 * @return null|string the token, or null when the value does not carry the prefix.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function stripPrefix(string $presented): ?string
 	{
@@ -201,7 +201,7 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	 * Whether key material is configured for the family an algorithm belongs to.
 	 * @param string $algorithm one of {@see ALGORITHMS}.
 	 * @return bool whether the secret (HS) or the public key (RS, ES) is set.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function hasKeyFor(string $algorithm): bool
 	{
@@ -211,7 +211,7 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	/**
 	 * Requires that at least one allowed algorithm has key material to verify with.
 	 * @throws \Prado\Exceptions\TConfigurationException when none does.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function requireSomeKey(): void
 	{
@@ -593,7 +593,7 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	/**
 	 * @return bool whether a token carrying no `exp` is refused. Defaults to false, which
 	 *   honors `exp` when present and accepts a token without one.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function getRequireExpiry(): bool
 	{
@@ -606,7 +606,7 @@ class TJwtWebhookSignature extends TWebhookSignature implements IWebhookVerifier
 	 * them; it is off by default only so that a provider which does not is not refused
 	 * outright on upgrade.
 	 * @param mixed $value whether to refuse a token without `exp`.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	public function setRequireExpiry($value): void
 	{

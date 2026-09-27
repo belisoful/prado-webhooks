@@ -140,7 +140,7 @@ class TIpWebhookVerifier extends TApplicationComponent implements IWebhookVerifi
 	 * allow list written in IPv4.
 	 * @param string $address the address as written.
 	 * @return null|string the bare address, or null when it is not an address at all.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function normalizeAddress(string $address): ?string
 	{

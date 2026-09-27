@@ -267,7 +267,7 @@ class TWebhookModule extends TPluginModule
 	 * @param mixed $payload the payload as the application gave it.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookTarget $target the target it is for.
 	 * @throws \Prado\Exceptions\TInvalidDataValueException when it cannot be encoded.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function assertEncodable(mixed $payload, TWebhookTarget $target): void
 	{
@@ -473,7 +473,7 @@ class TWebhookModule extends TPluginModule
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookDelivery $delivery what happened.
 	 * @return null|int the `Retry-After` of the last response in whole seconds, rounded up,
 	 *   or null when there was no response or it named none.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function retryAfterFor(TWebhookDelivery $delivery): ?int
 	{
@@ -504,7 +504,7 @@ class TWebhookModule extends TPluginModule
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem $item the claimed delivery,
 	 *   carrying its updated attempt count.
 	 * @param int $delaySeconds how long before it is due again.
-	 * @since 0.2.0
+	 * @since 0.1.0
 	 */
 	protected function retryOrAbandon(IWebhookQueue $queue, TWebhookQueueItem $item, int $delaySeconds): void
 	{
