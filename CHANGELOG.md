@@ -95,6 +95,16 @@ An audit release: every finding of a full review of the package, fixed and teste
 
 ### Changed
 
+- `{params}`, `{param:name}` and `Source="parameter"` mean the posted form fields alone:
+  the scalar entries of `$_POST`. `TWebhookService::getRequestParameters()` read the
+  framework's merged view of the request, which put the URL's `?webhook=<id>` and the rest
+  of the query string among them, so a Twilio-shaped `{url}{params}` hashed values Twilio
+  never signed and refused every delivery. The query string stays reachable through
+  `{url}`, `{query:name}` and `Source="query"`.
+- `TWebhookSender` shows a scheme the decoded fields of a form-encoded body as the request
+  parameters -- per attempt, and by the `Content-Type` actually sent -- so a delivery signed
+  with `{url}{params}` verifies through `TWebhookService` at the other end. It showed none,
+  so what this package signed under `{params}` was not what a PRADO receiver computed.
 - `TWebhookSender::send()` and `TWebhookModule::queue()` build and validate every target
   before delivering to or enqueueing any, so a bad specification refuses the whole call
   with nothing sent or stored.

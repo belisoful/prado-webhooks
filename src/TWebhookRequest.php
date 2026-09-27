@@ -17,7 +17,7 @@ use Prado\TPropertyValue;
  * TWebhookRequest class.
  *
  * Everything a signature scheme is allowed to look at, in one object: the raw body, the
- * headers, the method, the URL, the request parameters, and the address it came from.
+ * headers, the method, the URL, the posted form fields, and the address it came from.
  * Both directions build one -- {@see TWebhookEndpoint} from the request it received,
  * {@see TWebhookSender} from the request it is about to make -- so a scheme signs and
  * verifies against the same shape and cannot accidentally depend on being on one side.
@@ -26,6 +26,11 @@ use Prado\TPropertyValue;
  * Square signs the URL followed by the body, Twilio signs the URL followed by its sorted
  * form parameters, and Mailgun signs values it posted in the body. A verifier that could
  * see only the body could not express any of them.
+ *
+ * {@see getParameters Parameters} are the posted form fields alone -- what PHP parses a
+ * form-encoded body into -- and never the query string, which every inbound URL carries
+ * `?webhook=<id>` in and which {@see getQueryParameters} reads on its own. Both sides
+ * fill them the same way, so a scheme over `{params}` verifies what it signed.
  *
  * {@see getBody Body} is the bytes as received, byte for byte. Nothing in this package
  * re-encodes it before verification, because whitespace and key order are part of what the
@@ -48,7 +53,7 @@ class TWebhookRequest extends TComponent
 	/** @var string the absolute URL of the request */
 	private string $_url = '';
 
-	/** @var array<string, mixed> the request parameters, as the server parsed them */
+	/** @var array<string, mixed> the posted form fields, as the server parsed them */
 	private array $_parameters = [];
 
 	/** @var null|string the address the request came from */
@@ -60,9 +65,9 @@ class TWebhookRequest extends TComponent
 	 * @param array<string, string|string[]> $headers the headers; a repeated header may
 	 *   arrive as a list, and reads as its first value.
 	 * @param string $url the absolute URL, for schemes that sign it.
-	 * @param array<string, mixed> $parameters the request parameters, for schemes that
-	 *   read or sign them. A nested value -- what `a[b]=c` parses to -- has no defined
-	 *   serialization here and is skipped rather than guessed at.
+	 * @param array<string, mixed> $parameters the posted form fields, for schemes that
+	 *   read or sign them; not the query string. A nested value -- what `a[b]=c` parses
+	 *   to -- has no defined serialization here and is skipped rather than guessed at.
 	 * @param null|string $remoteAddress the address the request came from.
 	 */
 	public function __construct(
@@ -198,7 +203,8 @@ class TWebhookRequest extends TComponent
 	}
 
 	/**
-	 * @return array<string, mixed> the request parameters.
+	 * @return array<string, mixed> the posted form fields; the query string is
+	 *   {@see getQueryParameters} instead.
 	 */
 	public function getParameters(): array
 	{
@@ -206,7 +212,7 @@ class TWebhookRequest extends TComponent
 	}
 
 	/**
-	 * @param array<string, mixed> $value the request parameters.
+	 * @param array<string, mixed> $value the posted form fields.
 	 */
 	public function setParameters(array $value): void
 	{
@@ -214,7 +220,7 @@ class TWebhookRequest extends TComponent
 	}
 
 	/**
-	 * Reads one request parameter. Unlike a header, a parameter name is case sensitive.
+	 * Reads one posted form field. Unlike a header, a parameter name is case sensitive.
 	 * @param string $name the parameter name.
 	 * @return null|string the parameter value, or null when it is absent or not a scalar.
 	 */

@@ -287,10 +287,69 @@ class TWebhookSender extends TApplicationComponent
 		}
 
 		// The signer is shown the whole outbound request, not just the body, because the
-		// scheme on the other end may be one that signs the URL or the method.
-		$request = new TWebhookRequest($target->getMethod(), $delivery->getBody(), $headers, $target->getUrl());
+		// scheme on the other end may be one that signs the URL or the method. A
+		// form-encoded body is also shown as the fields the receiver's PHP will parse it
+		// into, so a scheme over {params} signs what a PRADO receiver computes; they are
+		// decoded per attempt, after any handler has rewritten the body, and by the
+		// Content-Type actually sent.
+		$body = $delivery->getBody();
+		$parameters = $this->isFormEncoded($headers, $target->getContentType()) ? $this->formParameters($body) : [];
+		$request = new TWebhookRequest($target->getMethod(), $body, $headers, $target->getUrl(), $parameters);
 
 		return array_merge($headers, $signer->sign($request));
+	}
+
+	/**
+	 * @param array<string, string> $headers the headers a delivery will be sent with.
+	 * @param string $default the target's content type, for headers that name none.
+	 * @return bool whether the body is form-encoded, by the content type actually sent.
+	 * @since 0.2.0
+	 */
+	protected function isFormEncoded(array $headers, string $default): bool
+	{
+		$contentType = $default;
+		foreach ($headers as $name => $value) {
+			if (strcasecmp((string) $name, THttpHeaderName::ContentType) === 0) {
+				$contentType = (string) $value;
+				break;
+			}
+		}
+
+		return str_starts_with(strtolower(trim($contentType)), TMediaType::FORM);
+	}
+
+	/**
+	 * Decodes a form-encoded body into the fields a receiver's PHP finds in `$_POST`, which
+	 * is what {@see TWebhookService::getRequestParameters()} hands a verifier there.
+	 *
+	 * Only scalar fields are kept, as the receiving side keeps only scalars: a nested
+	 * field has no serialization the two sides agree on. A body with more pairs than
+	 * `max_input_vars` reads as none rather than raising the warning the framework turns
+	 * into an exception; a PHP receiver truncates such a body at the same limit, so it
+	 * could not verify there in any case.
+	 *
+	 * @param string $body the form-encoded body.
+	 * @return array<string, string> the scalar fields, as PHP parses them.
+	 * @since 0.2.0
+	 */
+	protected function formParameters(string $body): array
+	{
+		if ($body === '') {
+			return [];
+		}
+		$limit = (int) ini_get('max_input_vars');
+		if ($limit > 0 && count(explode('&', $body)) > $limit) {
+			return [];
+		}
+		parse_str($body, $fields);
+		$parameters = [];
+		foreach ($fields as $name => $value) {
+			if (is_scalar($value)) {
+				$parameters[(string) $name] = (string) $value;
+			}
+		}
+
+		return $parameters;
 	}
 
 	/**

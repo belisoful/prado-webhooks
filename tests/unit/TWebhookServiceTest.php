@@ -791,19 +791,88 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 
 	public function testTheDefaultReadersAssembleTheRequestFromTheFramework()
 	{
-		$service = new TestEnvironmentWebhookService();
-		$request = $service->buildRequest();
+		$saved = $_POST;
+		$_POST = ['From' => '+15005550006', 'count' => 2, 'nested' => ['a' => 'b']];
+		try {
+			$service = new TestEnvironmentWebhookService();
+			$request = $service->buildRequest();
 
-		$this->assertSame('POST', $request->getMethod());
-		$this->assertSame('', $request->getBody(), 'php://input is empty on the command line');
-		$this->assertSame('push', $request->getHeader('x-github-event'));
-		$this->assertSame('https://example.com/index.php?webhook=github&page=1', $request->getUrl());
-		// Only scalars: a nested parameter has no serialization a scheme could sign.
-		$this->assertSame(['webhook' => 'github', 'page' => '1'], $request->getParameters());
-		$this->assertSame('192.0.2.7', $request->getRemoteAddress());
+			$this->assertSame('POST', $request->getMethod());
+			$this->assertSame('', $request->getBody(), 'php://input is empty on the command line');
+			$this->assertSame('push', $request->getHeader('x-github-event'));
+			$this->assertSame('https://example.com/index.php?webhook=github&page=1', $request->getUrl());
+			// The posted fields alone, as strings, and only the scalars: the query string --
+			// which the framework's merged view puts alongside them -- is not among them, and
+			// a nested field has no serialization a scheme could sign.
+			$this->assertSame(['From' => '+15005550006', 'count' => '2'], $request->getParameters());
+			$this->assertSame(['webhook' => 'github', 'page' => '1'], $request->getQueryParameters());
+			$this->assertSame('192.0.2.7', $request->getRemoteAddress());
 
-		$service->request->userHostAddress = '';
-		$this->assertNull($service->buildRequest()->getRemoteAddress());
+			$service->request->userHostAddress = '';
+			$this->assertNull($service->buildRequest()->getRemoteAddress());
+
+			$_POST = [];
+			$this->assertSame([], $service->buildRequest()->getParameters());
+		} finally {
+			$_POST = $saved;
+		}
+	}
+
+	public function testThePostedFieldsAreVerifiedWithoutTheServiceParameter()
+	{
+		// Twilio signs the URL -- query string included -- followed by the sorted posted
+		// fields, and nothing from the query string a second time. The framework's view of
+		// the request merges in webhook=twilio, which Twilio never saw.
+		$url = 'https://example.com/index.php?webhook=twilio';
+		$secret = 'twilio-auth-token';
+		$twilio = static function () use ($secret) {
+			$signature = new THmacWebhookSignature();
+			$signature->setSecret($secret);
+			$signature->setHeader('X-Twilio-Signature');
+			$signature->setAlgorithm('sha1');
+			$signature->setEncoding('base64');
+			$signature->setPayloadFormat('{url}{params}');
+
+			return $signature;
+		};
+		$saved = $_POST;
+		$_POST = ['From' => '+15005550006', 'CallSid' => 'CA123'];
+		try {
+			$service = new TestEnvironmentWebhookService();
+			$service->request->serviceParameter = 'twilio';
+			$service->request->requestUri = '/index.php?webhook=twilio';
+			$service->request->items = ['webhook' => 'twilio', 'From' => '+15005550006', 'CallSid' => 'CA123'];
+			$service->request->headers = [
+				'X-Twilio-Signature' => base64_encode(hash_hmac('sha1', $url . 'CallSidCA123From+15005550006', $secret, true)),
+			];
+			$endpoint = new TWebhookEndpoint();
+			$endpoint->setID('twilio');
+			$endpoint->setRequireJson(false);
+			$endpoint->setVerifier($twilio());
+			$service->addEndpoint($endpoint);
+			$accepted = 0;
+			$endpoint->onWebhook[] = function () use (&$accepted) {
+				$accepted++;
+			};
+
+			$this->assertSame(['From' => '+15005550006', 'CallSid' => 'CA123'], $service->buildRequest()->getParameters());
+
+			$service->run();
+			$this->assertSame(1, $accepted);
+			$this->assertSame(204, $service->response->statusCode);
+
+			// The signature the merged view would have matched is a forgery to a receiver
+			// that sees only the posted fields.
+			$service->response = new TestWebhookResponse();
+			$service->request->headers = [
+				'X-Twilio-Signature' => base64_encode(hash_hmac('sha1', $url . 'CallSidCA123From+15005550006webhooktwilio', $secret, true)),
+			];
+			$service->run();
+			$this->assertSame(1, $accepted);
+			$this->assertSame(401, $service->response->statusCode);
+		} finally {
+			$_POST = $saved;
+		}
 	}
 
 	public function testContentHeadersCgiKeepsOutOfHttpAreRestored()

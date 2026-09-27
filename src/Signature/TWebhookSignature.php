@@ -38,10 +38,15 @@ use Prado\TPropertyValue;
  * | `{id}` | the delivery id this signature is bound to |
  * | `{crc32}` | the CRC32 of the body, as a decimal string |
  * | `{header:Name}` | one request header |
- * | `{param:name}` | one request parameter |
+ * | `{param:name}` | one posted form field |
  * | `{query:name}` | one query string parameter |
  * | `{const:NAME}` | one entry of {@see setConstants Constants} |
- * | `{params}` | every request parameter, sorted by name, as name and value concatenated |
+ * | `{params}` | every posted form field, sorted by name, as name and value concatenated |
+ *
+ * A form field is a scalar entry of the posted body as PHP parses it -- `$_POST` on the
+ * receiving side, the encoded payload on the sending side. The query string is not among
+ * them: every inbound URL carries `?webhook=<id>`, which no provider signed, so it is
+ * reached only through `{url}`, `{query:name}` and `Source="query"`.
  *
  * Which makes the schemes in the wild configuration rather than code:
  *
@@ -154,11 +159,12 @@ abstract class TWebhookSignature extends TApplicationComponent
 	}
 
 	/**
-	 * Every request parameter, sorted by name, as name immediately followed by value.
+	 * Every posted form field, sorted by name, as name immediately followed by value.
 	 *
 	 * This is the serialization Twilio-shaped schemes append to the URL. Sorting is by
-	 * name, ascending, which is what makes the result independent of the order the
-	 * parameters arrived in.
+	 * name, ascending, which is what makes the result independent of the order the fields
+	 * arrived in. The query string is not part of it; a Twilio-shaped scheme covers that
+	 * through `{url}`.
 	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request.
 	 * @return string the concatenated parameters.
