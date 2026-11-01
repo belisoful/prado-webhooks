@@ -13,6 +13,7 @@ namespace Belisoful\Prado\Web\Webhooks;
 use Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner;
 use Belisoful\Prado\Web\Webhooks\Signature\TWebhookSignature;
 use Prado\Exceptions\TInvalidDataValueException;
+use Prado\IO\Async\TAsync;
 use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
 use Prado\TApplicationComponent;
@@ -482,19 +483,17 @@ class TWebhookSender extends TApplicationComponent
 	 * Waits between attempts. Overriding this is how a test runs the retry policy without
 	 * spending the wall clock on it.
 	 *
-	 * The wait is taken a second at a time: `usleep` is only required to work for arguments
-	 * under a second, and some platforms honor nothing above it.
+	 * The wait is {@see \Prado\IO\Async\TAsync::sleep()}, the framework's one pause: from
+	 * the main fiber it runs the event loop until the timer fires, and from a worker fiber
+	 * -- a cron task drained alongside others, a send started with `TAsync::run()` -- it
+	 * yields, so a backoff holds this delivery and nothing else. A `usleep` here would hold
+	 * every fiber in the process for the length of the backoff.
 	 *
-	 * @param int $milliseconds how long to wait.
+	 * @param int $milliseconds how long to wait; nothing or less waits not at all.
 	 */
 	protected function pause(int $milliseconds): void
 	{
-		$remaining = $milliseconds;
-		while ($remaining > 0) {
-			$chunk = min($remaining, 1000);
-			usleep($chunk * 1000);
-			$remaining -= $chunk;
-		}
+		TAsync::sleep($milliseconds / 1000);
 	}
 
 	/**

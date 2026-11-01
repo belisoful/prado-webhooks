@@ -10,6 +10,7 @@ use Belisoful\Prado\Web\Webhooks\TWebhookService;
 use Belisoful\Prado\Web\Webhooks\TWebhookTarget;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidDataValueException;
+use Prado\IO\Async\TAsync;
 use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
 use Prado\IO\HttpClient\THttpClientResponse;
@@ -351,7 +352,7 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 
 	public function testANegativeRetryAfterIsNotANegativeWait()
 	{
-		// A negative wait handed to usleep is an error at best; it must clamp to nothing.
+		// A negative wait is an error at best; it must clamp to nothing.
 		$this->answer(
 			new THttpClientResponse(429, ['Retry-After' => '-5'], ''),
 			new THttpClientResponse(200)
@@ -980,6 +981,27 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 		$sender->send(self::URL, ['id' => 1]);
 
 		$this->assertGreaterThanOrEqual(0.015, microtime(true) - $started);
+	}
+
+	public function testThePauseYieldsToTheEventLoopInsideAFiber()
+	{
+		// A send started in a worker fiber suspends at its first backoff rather than holding
+		// the process for it: TAsync::run() returns while the delivery is still in flight, and
+		// awaiting the future runs the loop until the retry has been made.
+		$sender = new TWebhookSender();
+		$sender->setHttpClient($this->_client);
+		$sender->setMaxAttempts(2);
+		$sender->setRetryDelay(20);
+		$this->answer(new THttpClientResponse(500), new THttpClientResponse(200));
+
+		$future = TAsync::run(fn () => $sender->send(self::URL, ['id' => 1]));
+
+		$this->assertFalse($future->isComplete(), 'the backoff suspended the fiber instead of blocking');
+		$this->assertCount(1, $this->_client->requests, 'the first attempt was made before the pause');
+		$deliveries = $future->await();
+		$this->assertCount(2, $this->_client->requests);
+		$this->assertTrue($deliveries[0]->getSuccessful());
+		$this->assertSame(2, $deliveries[0]->getAttempts());
 	}
 
 	public function testDefaults()

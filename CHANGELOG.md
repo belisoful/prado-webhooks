@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- PHP 8.2 or newer is required, as PRADO 4.4 now requires it. The Composer platform and the
+  CI matrix follow; a package pinned to 8.1 could no longer install the framework at all.
+- `TWebhookSender` waits out a retry backoff through PRADO's `TAsync::sleep()` rather than
+  `usleep`. From the main fiber the wait runs the event loop until it is over, as before
+  from the caller's point of view; from a worker fiber -- a cron task drained alongside
+  others, a `send()` started with `TAsync::run()` -- it yields, so a backoff holds that one
+  delivery rather than the whole process. `pause()` keeps its signature, so a subclass that
+  overrides it to skip the wait still does.
+
 ## [0.1.0] - 2026-09-27
 
 The first release. Before it was tagged the package went through a full security review;

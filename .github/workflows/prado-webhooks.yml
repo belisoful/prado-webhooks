@@ -59,12 +59,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php-versions: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        php-versions: ['8.2', '8.3', '8.4', '8.5']
         dependencies: ['highest']
         include:
           # The oldest versions the constraints allow, on the oldest PHP: what a consumer with
           # a conservative lock file gets.
-          - php-versions: '8.1'
+          - php-versions: '8.2'
             dependencies: 'lowest'
 
     steps:

@@ -198,6 +198,10 @@ The framework is at `vendor/pradosoft/prado/`, with its own `AGENTS.md`. What ma
   `onSaveStateComplete` → `onPreFlushOutput` → `flushOutput` → `onEndRequest` (or `onError`).
 - `TPageService::onPreRunPage` gives a module access to the page lifecycle before it runs.
 - Application configuration is XML or PHP.
+- PRADO 4.4 runs on an event loop with Fibers (`Prado\IO\Async`). A pause goes through
+  `TAsync::sleep()`, never `usleep` or `sleep`: from the main fiber it runs the loop until the
+  timer fires, and from a worker fiber -- a cron task drained alongside others -- it yields.
+  `TWebhookSender::pause()` is the one wait in this package, and that is what it does.
 
 ## Testing
 
