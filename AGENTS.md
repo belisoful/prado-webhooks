@@ -106,6 +106,10 @@ These are what the package standard checks enforce. Breaking one fails the unit 
   fully qualified name. Traits are exempt: they have no short name to resolve.
 - Every error code raised in `src/` has text in `config/errorMessages.txt`, and every message in
   that file is raised somewhere in `src/`. No duplicate keys.
+- Every error message is an ICU MessageFormat pattern that renders every argument it names.
+  PRADO 4.4 formats message file entries with `MessageFormatter`, where an apostrophe next to a
+  brace quotes what follows: `'{0}'` is the literal text `{0}`, so a quoted placeholder is
+  written `''{0}''`. An apostrophe elsewhere, as in "can't", is literal.
 - Extension settings live under `extra.prado`. The un-nested `extra.bootstrap` is deprecated; do
   not reintroduce it.
 - The bootstrap class autoloads, is a `TModule`, and lives under the PSR-4 root.

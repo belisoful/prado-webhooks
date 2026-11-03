@@ -327,6 +327,39 @@ class PackageStandardTest extends PHPUnit\Framework\TestCase
 		}
 	}
 
+	public function testEveryErrorMessageIsAnIcuPatternThatRendersEveryArgument()
+	{
+		// The framework formats a message file entry with MessageFormatter, in which an
+		// apostrophe next to a brace quotes it: '{0}' is the literal text {0}, and ''{0}'' is the
+		// argument in quotes. A message that lost its argument this way still resolves to text,
+		// so the resolve check above cannot see it; this one renders every argument and looks.
+		foreach ($this->errorMessages() as $code => $message) {
+			preg_match_all('/\{\s*(\d+)\s*[,}]/', $message, $matches);
+			$numbers = array_map('intval', array_unique($matches[1]));
+			$args = [];
+			foreach ($numbers === [] ? [] : range(0, max($numbers)) as $i) {
+				$args[$i] = "\u{AB}{$i}\u{BB}";
+			}
+			$this->assertNotFalse(
+				MessageFormatter::formatMessage('en', $message, $args),
+				"the message for {$code} is an ICU MessageFormat pattern"
+			);
+			$rendered = (new TException($code, ...$args))->getMessage();
+			$this->assertDoesNotMatchRegularExpression(
+				'/\{\d/',
+				$rendered,
+				"the message for {$code} quotes a placeholder; double the apostrophe: ''{0}''"
+			);
+			foreach ($numbers as $i) {
+				$this->assertStringContainsString(
+					"\u{AB}{$i}\u{BB}",
+					$rendered,
+					"the message for {$code} renders argument {$i}"
+				);
+			}
+		}
+	}
+
 	public function testEverySourceFileCompiles()
 	{
 		foreach ($this->sourceFiles() as $path => $relative) {

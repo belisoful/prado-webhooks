@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivery rather than the whole process. `pause()` keeps its signature, so a subclass that
   overrides it to skip the wait still does.
 
+### Fixed
+
+- Every error message that quoted a placeholder, as in `'{0}'`, printed the literal text
+  `{0}` instead of the value: PRADO 4.4 now formats a message file entry as an ICU
+  MessageFormat pattern, in which an apostrophe next to a brace quotes what follows. The
+  apostrophes are doubled, `''{0}''`, which ICU renders as the value in single quotes. The
+  package standard checks now render every message with every argument and fail on one that
+  goes missing.
+
 ## [0.1.0] - 2026-09-27
 
 The first release. Before it was tagged the package went through a full security review;
