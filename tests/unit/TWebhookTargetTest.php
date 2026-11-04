@@ -7,6 +7,8 @@ use Prado\Exceptions\TConfigurationException;
 
 class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const URL = 'https://example.com/hooks/prado';
 
 	protected function tearDown(): void
@@ -64,12 +66,14 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 	public function testAnArrayWithoutAUrlIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_target_url_required');
 		TWebhookTarget::ensure(['events' => ['a']]);
 	}
 
 	public function testSomethingElseEntirelyIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_target_invalid');
 		TWebhookTarget::ensure(42);
 	}
 
@@ -80,6 +84,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 				TWebhookTarget::ensure($url);
 				$this->fail("'{$url}' should not be a usable webhook URL");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_url_invalid'), $e->getMessage());
 				$this->assertStringContainsString('http', $e->getMessage());
 			}
 		}
@@ -232,6 +237,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 	public function testAnEmptyMethodIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_target_method_required');
 		TWebhookTarget::ensure(['url' => self::URL, 'method' => ' ']);
 	}
 
@@ -240,6 +246,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 		// The object branch used to pass anything through; a target that was never given a
 		// URL would then reach the transport as a delivery to nowhere.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_target_url_required');
 		$this->expectExceptionMessage('Url');
 		TWebhookTarget::ensure(new TWebhookTarget());
 	}
@@ -250,6 +257,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 			TWebhookTarget::ensure(['url' => self::URL, 'ulr' => 'typo']);
 			$this->fail('an unknown key should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_property_unknown'), $e->getMessage());
 			$this->assertStringContainsString("'ulr'", $e->getMessage());
 			$this->assertStringContainsString('secret', $e->getMessage(), 'the message says what the keys are');
 		}
@@ -259,6 +267,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 	{
 		// The unknown-key wrapping must not swallow the URL check's own message.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_target_url_invalid');
 		$this->expectExceptionMessage('http');
 		TWebhookTarget::ensure(['url' => 'not a url']);
 	}
@@ -294,6 +303,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 			TWebhookTarget::ensure(self::URL);
 			$this->fail('the validator refused, so the target should not be built');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_url_refused'), $e->getMessage());
 			$this->assertStringContainsString(self::URL, $e->getMessage());
 			$this->assertStringContainsString('refused', $e->getMessage());
 		}
@@ -320,6 +330,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 		try {
 			TWebhookTarget::ensure('ftp://example.com/hook');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_url_invalid'), $e->getMessage());
 		}
 		$this->assertSame(0, $asked);
 	}
@@ -364,6 +375,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 				TWebhookTarget::ensure($url);
 				$this->fail("{$url} should be refused");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_url_refused'), $e->getMessage());
 				$this->assertStringContainsString('refused', $e->getMessage(), $url);
 			}
 		}
@@ -379,6 +391,7 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 			TWebhookTarget::ensure(['url' => self::URL, 'method' => '']);
 			$this->fail('an empty method should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_method_required'), $e->getMessage());
 			$this->assertStringContainsString('Method', $e->getMessage());
 			$this->assertStringNotContainsString('at least one', $e->getMessage(), 'not the endpoint\'s message');
 		}
@@ -400,12 +413,14 @@ class TWebhookTargetTest extends PHPUnit\Framework\TestCase
 					TWebhookTarget::ensure([$key => 'is_string', 'url' => self::URL]);
 					$this->fail("'$key' should be refused");
 				} catch (TConfigurationException $e) {
+					$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_property_unknown'), $e->getMessage());
 					$this->assertStringContainsString("'$key'", $e->getMessage());
 				}
 			}
 			$this->assertNotSame('is_string', TWebhookTarget::getUrlValidator());
 
 			$this->expectException(TConfigurationException::class);
+			$this->expectErrorCode('webhooks_target_url_refused');
 			TWebhookTarget::ensure(self::URL);
 		} finally {
 			TWebhookTarget::setUrlValidator(null);

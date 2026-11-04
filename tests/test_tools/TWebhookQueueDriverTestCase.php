@@ -29,6 +29,8 @@ use Prado\Exceptions\TInvalidDataValueException;
  */
 abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 
 	private TDbConnection $_db;
 	private TDbWebhookQueue $_queue;
@@ -446,6 +448,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 			$this->_queue->enqueue($item);
 			$this->fail('an unencodable payload should be refused');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_payload_invalid'), $e->getMessage());
 			$this->assertNull($item->getId(), 'never stored');
 		}
 		$this->assertSame(0, $this->_queue->getCount());
@@ -454,6 +457,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 	public function testAPayloadThatIsNotValidUtf8IsRefused()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_queue_payload_invalid');
 		$this->_queue->enqueue($this->item('https://example.com/hook', "\xB1\x31"));
 	}
 
@@ -465,6 +469,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 			$this->_queue->enqueue($item);
 			$this->fail('an unencodable specification should be refused');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_spec_invalid'), $e->getMessage());
 			$this->assertStringContainsString('target', $e->getMessage());
 		}
 		$this->assertSame(0, $this->_queue->getCount());
@@ -644,6 +649,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 		$queue->setTableName('nowhere');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_table_missing');
 		$queue->getCount();
 	}
 
@@ -654,6 +660,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 				(new TDbWebhookQueue())->setTableName($name);
 				$this->fail("'{$name}' should be refused");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_table_invalid'), $e->getMessage());
 				$this->assertNotSame('', $e->getMessage());
 			}
 		}
@@ -665,6 +672,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 	public function testAQueueWithNoConnectionSaysSo()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_connection_required');
 		(new TDbWebhookQueue())->getDbConnection();
 	}
 
@@ -674,6 +682,7 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 		$queue->setConnectionID('nothing-by-that-name');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_connection_invalid');
 		$queue->getDbConnection();
 	}
 
@@ -706,5 +715,129 @@ abstract class TWebhookQueueDriverTestCase extends PHPUnit\Framework\TestCase
 		$this->_queue->enqueue($item);
 
 		$this->assertSame($payload, $this->_queue->claim(1, 60)[0]->getPayload());
+	}
+
+	public function testAnAttemptThatNeverReportedBackIsCountedWhenTheRowIsClaimedAgain()
+	{
+		// A runner that dies mid-attempt -- out of memory on a receiver's endless response --
+		// never writes its attempt back. Counted on the next claim, a delivery that takes its
+		// runner down each time still runs out of attempts instead of stalling every batch.
+		$item = $this->item();
+		$this->_queue->enqueue($item);
+		$this->assertSame(0, $this->_queue->claim(10, 600)[0]->getAttempts());
+
+		$command = $this->_db->createCommand(
+			'UPDATE ' . $this->_queue->getTableName() . ' SET leaseduntil = :t WHERE tabuid = :id'
+		);
+		$command->bindValue(':t', time() - 1);
+		$command->bindValue(':id', $item->getId());
+		$command->execute();
+
+		$this->assertSame(1, $this->newQueue()->claim(10, 600)[0]->getAttempts());
+	}
+
+	public function testAnAttemptThatReportedBackIsNotCountedAgain()
+	{
+		$this->_queue->enqueue($this->item());
+		$claimed = $this->_queue->claim(10, 600)[0];
+		$claimed->setAttempts(1);
+		$this->_queue->reschedule($claimed, 0);
+
+		$this->assertSame(1, $this->newQueue()->claim(10, 600)[0]->getAttempts());
+	}
+
+	public function testAWriteWithoutALeaseCannotReleaseARunnersLease()
+	{
+		// An application replaying or abandoning a row by id holds no lease. Addressed by id
+		// alone, its write cleared the lease of the runner sending that row.
+		$item = $this->item();
+		$this->_queue->enqueue($item);
+		$held = $this->newQueue()->claim(1, 600)[0];
+
+		$this->_queue->reschedule($item, 0);
+		$this->assertSame($held->getLeaseToken(), $this->leaseTokenInTheTable());
+		$this->_queue->abandon($item);
+		$this->assertSame(0, $this->_queue->getCount(TWebhookQueueStatus::Failed));
+		$this->assertSame($held->getLeaseToken(), $this->leaseTokenInTheTable());
+	}
+
+	public function testAWriteWithoutALeaseWorksWhenNobodyHoldsTheRow()
+	{
+		$item = $this->item();
+		$this->_queue->enqueue($item);
+
+		$this->_queue->abandon($item);
+		$this->assertSame(1, $this->_queue->getCount(TWebhookQueueStatus::Failed));
+		$this->_queue->reschedule($item, 0);
+		$this->assertSame(1, $this->_queue->getCount(TWebhookQueueStatus::Pending), 'replayed');
+	}
+
+	public function testAPayloadComesBackEncodingAsItWent()
+	{
+		// Decoded as arrays, `{}` came back as `[]` and `{"0":"a","1":"b"}` as a list, so a
+		// queued delivery was not the body an inline one would have been.
+		$json = '{"data":{},"m":{"0":"a","1":"b"},"list":["x"],"map":{"k":"v"},"n":null}';
+		$this->_queue->enqueue($this->item('https://example.com/hook', json_decode($json)));
+
+		$payload = $this->_queue->claim(1, 60)[0]->getPayload();
+
+		$this->assertSame($json, json_encode($payload));
+		$this->assertIsArray($payload, 'an object an array can stand for is an array');
+		$this->assertSame(['k' => 'v'], $payload['map']);
+	}
+
+	public function testLosingTheRaceToCreateTheTableIsNotAnError()
+	{
+		// Two runners that both found the table missing race to create it; the loser's
+		// CREATE INDEX fails on the winner's index.
+		$winner = $this->newQueue();
+		$loser = new class () extends TDbWebhookQueue {
+			public ?TDbWebhookQueue $winner = null;
+
+			protected function createTable(): void
+			{
+				$this->winner?->getCount();
+				parent::createTable();
+			}
+		};
+		$loser->setDbConnection($this->_db);
+		$loser->setAutoCreateTable(true);
+		$loser->winner = $winner;
+
+		$this->assertSame(0, $loser->getCount());
+	}
+
+	public function testAChunkedPruneLeavesARowReplayedBetweenItsStatements()
+	{
+		$item = $this->item();
+		$this->_queue->enqueue($item);
+		$this->_queue->abandon($item);
+		$this->age($item, 3600);
+		$racer = new class () extends TDbWebhookQueue {
+			public ?Closure $beforeDelete = null;
+			public int $calls = 0;
+
+			public function getDbConnection(): TDbConnection
+			{
+				$connection = parent::getDbConnection();
+				if ($this->beforeDelete !== null && debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] === 'prune') {
+					// prune() asks for the connection once per statement; the second is the DELETE.
+					if (++$this->calls === 2) {
+						($this->beforeDelete)();
+					}
+				}
+
+				return $connection;
+			}
+		};
+		$racer->setDbConnection($this->_db);
+		$racer->beforeDelete = function () use ($item) {
+			$this->_db->createCommand(
+				'UPDATE ' . $this->_queue->getTableName() . " SET status = '" . TWebhookQueueStatus::Pending->value . "' WHERE tabuid = " . (int) $item->getId()
+			)->execute();
+		};
+
+		$this->assertSame(0, $racer->prune(60, 10), 'the replayed row is not finished any more');
+		$this->assertSame(1, $this->_queue->getCount(TWebhookQueueStatus::Pending));
 	}
 }

@@ -8,6 +8,7 @@ use Prado\Exceptions\TConfigurationException;
 use Prado\Prado;
 use Prado\Util\TPluginModule;
 use Prado\Xml\TXmlDocument;
+use Belisoful\Prado\Web\Webhooks\Signature\TAnyWebhookSignature;
 
 /**
  * The module with the page-service mount taken out of the way. TPluginModule::init attaches
@@ -23,6 +24,8 @@ class TestWebhookModule extends TWebhookModule
 
 class TWebhookModuleTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private TWebhookModule $_module;
 
 	protected function setUp(): void
@@ -165,6 +168,7 @@ class TWebhookModuleTest extends PHPUnit\Framework\TestCase
 		$module = new TestWebhookModule();
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_invalid');
 		$module->init($this->xml(
 			'<module id="belisoful/prado-webhooks"><signature class="Prado\TComponent" /></module>'
 		));
@@ -202,5 +206,87 @@ class TWebhookModuleTest extends PHPUnit\Framework\TestCase
 		// name itself, so the alias, not the return value, is what tells the truth here.
 		Prado::usingClass('TWebhookModule');
 		$this->assertSame(TWebhookModule::class, (new ReflectionClass('TWebhookModule'))->getName());
+	}
+
+	public function testAnSnsVerifierIsRefusedAsTheSignatureAtBoot()
+	{
+		// It is a TPublicKeyWebhookSignature, so it passes as a signer, and failed only on the
+		// first delivery.
+		$module = new TestWebhookModule();
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verify_only');
+		$module->init($this->xml(
+			'<module id="belisoful/prado-webhooks"><signature class="Belisoful\Prado\Web\Webhooks\Signature\TSnsWebhookVerifier" TopicArn="arn:aws:sns:us-east-1:1:t" /></module>'
+		));
+	}
+
+	public function testACompositeWithNothingThatSignsIsRefusedAtBoot()
+	{
+		$module = new TestWebhookModule();
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_signers_required');
+		$module->init($this->xml(
+			'<module id="belisoful/prado-webhooks"><signature class="Belisoful\Prado\Web\Webhooks\Signature\TAnyWebhookSignature">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\TIpWebhookVerifier" Addresses="192.0.2.0/24" />'
+			. '</signature></module>'
+		));
+	}
+
+	public function testACompositeThatSignsThroughASnsChildIsRefusedAtBoot()
+	{
+		$module = new TestWebhookModule();
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verify_only');
+		$module->init($this->xml(
+			'<module id="belisoful/prado-webhooks"><signature class="Belisoful\Prado\Web\Webhooks\Signature\TAllWebhookSignature">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" />'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\TSnsWebhookVerifier" TopicArn="arn:aws:sns:us-east-1:1:t" />'
+			. '</signature></module>'
+		));
+	}
+
+	public function testACompositeThatCanSignIsAccepted()
+	{
+		$module = new TestWebhookModule();
+		$module->init($this->xml(
+			'<module id="belisoful/prado-webhooks"><signature class="Belisoful\Prado\Web\Webhooks\Signature\TAnyWebhookSignature">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\TIpWebhookVerifier" Addresses="192.0.2.0/24" />'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" />'
+			. '</signature></module>'
+		));
+
+		$this->assertInstanceOf(TAnyWebhookSignature::class, $module->getSignature());
+	}
+
+	public function testAPropertyBesideTheClassInAPhpSignatureIsRefused()
+	{
+		// Written there instead of in `properties`, it used to be ignored: the scheme was built
+		// without it, and for a JWT Audience that is a check quietly dropped.
+		$module = new TestWebhookModule();
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_property_misplaced');
+		$module->init([
+			'signature' => [
+				'class' => THmacWebhookSignature::class,
+				'Secret' => 's3cret',
+				'properties' => ['Prefix' => 'sha256='],
+			],
+		]);
+	}
+
+	public function testTheRetryCeilingAndContainmentPassThroughToTheSender()
+	{
+		$module = new TestWebhookModule();
+		$module->setMaxRetryDelay(1234);
+		$module->setContainHandlerErrors('true');
+
+		$this->assertSame(1234, $module->getSender()->getMaxRetryDelay());
+		$this->assertSame(1234, $module->getMaxRetryDelay());
+		$this->assertTrue($module->getSender()->getContainHandlerErrors());
+		$this->assertTrue($module->getContainHandlerErrors());
 	}
 }

@@ -199,15 +199,17 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 	 * Signs an outbound request with the private key.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request about to be made.
 	 * @throws \Prado\Exceptions\TConfigurationException when no private key is set, or it
-	 *   will not parse, or the signing fails.
-	 * @return array<string, string> the signature header, plus the timestamp header when the
-	 *   scheme names one.
+	 *   will not parse, the signature is read from somewhere other than a header, or the
+	 *   signing fails.
+	 * @return array<string, string> the signature header, plus the timestamp and id headers
+	 *   when the scheme names them.
 	 */
 	public function sign(TWebhookRequest $request): array
 	{
 		if ($this->_privateKey === '') {
 			throw new TConfigurationException('webhooks_private_key_required', static::class);
 		}
+		$this->assertSignsInHeader();
 		$key = $this->loadPrivateKey($this->readKeyMaterial($this->_privateKey));
 		if ($key === false) {
 			throw new TConfigurationException(
@@ -221,6 +223,11 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 		if ($this->getTimestampName() !== null) {
 			$bound['timestamp'] = (string) time();
 		}
+		if ($this->getIdName() !== null) {
+			// As {@see THmacWebhookSignature::sign}: the id the request carries, which the
+			// sender sets to the delivery's own, and a fresh one for a request without.
+			$bound['id'] = $this->presentedId($request) ?? bin2hex(random_bytes(16));
+		}
 
 		$raw = '';
 		if (!openssl_sign($this->expandPayload($request, $bound), $raw, $key, $this->_algorithm)) {
@@ -230,6 +237,9 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 		$signed = [$this->getName() => $this->getPrefix() . $this->getEncoding()->encode($raw)];
 		if ($bound['timestamp'] !== '') {
 			$signed[(string) $this->getTimestampName()] = $bound['timestamp'];
+		}
+		if ($bound['id'] !== '') {
+			$signed[(string) $this->getIdName()] = $bound['id'];
 		}
 
 		return $signed;
@@ -357,6 +367,26 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 			return $cached;
 		}
 
+		$certificate = $this->downloadCertificate($url);
+		if ($certificate === null) {
+			// Not cached: a response that is not a key is not worth remembering, and
+			// remembering it would refuse every delivery until it expired.
+			return null;
+		}
+		$cache?->set($cacheKey, $certificate, $this->_cacheTtl);
+
+		return $certificate;
+	}
+
+	/**
+	 * Downloads a certificate and checks it is a key this scheme can use.
+	 * @param string $url the certificate URL, already checked against the allow list.
+	 * @return null|string the certificate, or null when it could not be fetched, is empty,
+	 *   is over {@see getCertificateMaxSize CertificateMaxSize}, or is not a key.
+	 * @since 0.2.0
+	 */
+	protected function downloadCertificate(string $url): ?string
+	{
 		try {
 			$response = $this->getHttpClient()->download('GET', $url);
 		} catch (THttpClientException) {
@@ -369,11 +399,8 @@ class TPublicKeyWebhookSignature extends TWebhookSignature implements IWebhookVe
 			return null;
 		}
 		if ($this->loadPublicKey($certificate) === false) {
-			// Not cached: a response that is not a key is not worth remembering, and
-			// remembering it would refuse every delivery until it expired.
 			return null;
 		}
-		$cache?->set($cacheKey, $certificate, $this->_cacheTtl);
 
 		return $certificate;
 	}

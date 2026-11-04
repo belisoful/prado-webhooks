@@ -1,5 +1,9 @@
 parameters:
-    phpVersion: 80500 # PHP 8.5, the newest runtime the package supports
+    # Every runtime the package supports, 8.2 through 8.5: a function newer than the floor is
+    # reported, and so is one removed by the newest.
+    phpVersion:
+        min: 80200
+        max: 80500
     # Level 3 is the floor every extension starts from. Raise it in a package that can carry
     # it -- belisoful/prado-bayesian runs at level 9 -- but do not lower it here.
     level: 3

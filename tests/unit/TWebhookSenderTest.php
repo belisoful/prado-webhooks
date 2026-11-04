@@ -14,6 +14,8 @@ use Prado\IO\Async\TAsync;
 use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
 use Prado\IO\HttpClient\THttpClientResponse;
+use Prado\Caching\ICache;
+use Prado\IO\HttpClient\TCachedHttpClient;
 
 /**
  * A transport that answers from a script and records what it was asked, so the retry policy
@@ -24,7 +26,7 @@ class TestHttpClient extends THttpClient
 	/** @var array<int, array{method: string, url: string, headers: array, body: ?string}> */
 	public array $requests = [];
 
-	/** @var array<int, THttpClientResponse|Throwable> answers, in order; the last one repeats */
+	/** @var array<int, Throwable|THttpClientResponse> answers, in order; the last one repeats */
 	public array $answers = [];
 
 	public function download(string $method, string $url, array $headers = [], ?string $body = null): THttpClientResponse
@@ -138,6 +140,8 @@ class TestReplayWebhookService extends TWebhookService
 
 class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const URL = 'https://example.com/hooks/prado';
 
 	private TestWebhookSender $_sender;
@@ -453,6 +457,7 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 			$this->_sender->send([self::URL, 'https://other.example/hook', 42], ['id' => 1]);
 			$this->fail('a bad specification should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_invalid'), $e->getMessage());
 			$this->assertSame([], $this->_client->requests, 'nothing was sent');
 		}
 	}
@@ -899,6 +904,7 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 	public function testAPayloadThatCannotBeEncodedIsRefused()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_payload_invalid');
 		$this->_sender->send(self::URL, ['bad' => fopen('php://memory', 'r')]);
 	}
 
@@ -956,6 +962,7 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 	public function testAFormContentTypeNeedsSomethingItCanEncode()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_payload_form_invalid');
 		$this->_sender->send([['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']], 42);
 	}
 
@@ -1083,5 +1090,160 @@ class TWebhookSenderTest extends PHPUnit\Framework\TestCase
 		);
 		$this->assertSame(['user-agent'], array_values($names));
 		$this->assertSame('Mine/1', $this->_client->requests[0]['headers']['user-agent']);
+	}
+
+	public function testAnHttpDateRetryAfterPastTheIntegerRangeSaturatesRatherThanThrowing()
+	{
+		// strtotime reads `@<seconds>` as a date, and its distance from now in milliseconds is
+		// past what an int holds; returned as a float, it was a TypeError that aborted send().
+		$this->assertSame(PHP_INT_MAX, $this->_sender->parseRetryAfter(new THttpClientResponse(503, ['Retry-After' => '@99999999999999999'])));
+
+		$this->_sender->setMaxAttempts(2);
+		$this->answer(new THttpClientResponse(503, ['Retry-After' => '@99999999999999999']), new THttpClientResponse(200));
+		$delivery = $this->_sender->send(self::URL, ['id' => 1])[0];
+
+		$this->assertTrue($delivery->getSuccessful());
+		$this->assertSame([$this->_sender->getMaxRetryDelay()], $this->_sender->pauses, 'capped like any other');
+	}
+
+	public function testTheClientACacheWrapperHoldsCannotFollowRedirectsEither()
+	{
+		// TCachedHttpClient keeps its own settings and hands a POST straight to the client it
+		// wraps, so a setting made on the wrapper alone never reached the request.
+		$this->_client->setFollowRedirects(true);
+		$this->_client->setTimeout(30);
+		$cache = new class () implements ICache {
+			public static function getIsAvailable(): bool
+			{
+				return true;
+			}
+
+			public function get($id)
+			{
+				return false;
+			}
+
+			public function set($id, $value, $expire = 0, $dependency = null)
+			{
+				return true;
+			}
+
+			public function add($id, $value, $expire = 0, $dependency = null)
+			{
+				return true;
+			}
+
+			public function delete($id)
+			{
+				return true;
+			}
+
+			public function flush()
+			{
+				return true;
+			}
+		};
+		$this->_sender->setHttpClient(new TCachedHttpClient($this->_client, $cache));
+		$this->_sender->setTimeout(4);
+		$this->answer(new THttpClientResponse(200));
+
+		$this->_sender->send(self::URL, ['id' => 1]);
+
+		$this->assertCount(1, $this->_client->requests, 'the POST went to the wrapped client');
+		$this->assertFalse($this->_client->getFollowRedirects());
+		$this->assertSame(4, (int) $this->_client->getTimeout());
+	}
+
+	public function testEveryAttemptSetsItsOwnTimeout()
+	{
+		// A backoff yields the fiber, and another delivery on the same client can set its own
+		// timeout meanwhile; the retry must not inherit it.
+		$client = new class () extends TestHttpClient {
+			public array $timeouts = [];
+
+			public function download(string $method, string $url, array $headers = [], ?string $body = null): THttpClientResponse
+			{
+				$this->timeouts[] = (int) $this->getTimeout();
+
+				return parent::download($method, $url, $headers, $body);
+			}
+		};
+		$sender = new class () extends TestWebhookSender {
+			public ?THttpClient $other = null;
+
+			protected function pause(int $milliseconds): void
+			{
+				parent::pause($milliseconds);
+				$this->other?->setTimeout(99);
+			}
+		};
+		$sender->setHttpClient($client);
+		$sender->other = $client;
+		$sender->setTimeout(7);
+		$client->answers = [new THttpClientResponse(503), new THttpClientResponse(200)];
+
+		$sender->send(self::URL, ['id' => 1]);
+
+		$this->assertSame([7, 7], $client->timeouts);
+	}
+
+	public function testContainingHandlerErrorsCoversTheCallbackAndNothingAfter()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+
+		$delivery = $this->_sender->containingHandlerErrors(fn () => $this->_sender->send(self::URL, ['id' => 1])[0]);
+
+		$this->assertSame('the handler broke', $delivery->getHandlerError());
+		$this->assertFalse($this->_sender->getContainHandlerErrors(), 'the sender-wide setting is untouched');
+		$this->expectException(RuntimeException::class);
+		$this->_sender->send(self::URL, ['id' => 1]);
+	}
+
+	public function testContainingHandlerErrorsEndsEvenWhenTheCallbackThrows()
+	{
+		try {
+			$this->_sender->containingHandlerErrors(function () {
+				throw new LogicException('the callback broke');
+			});
+			$this->fail('the callback exception propagates');
+		} catch (LogicException $e) {
+			$this->assertSame('the callback broke', $e->getMessage());
+		}
+		$this->answer(new THttpClientResponse(200));
+		$this->_sender->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+
+		$this->expectException(RuntimeException::class);
+		$this->_sender->send(self::URL, ['id' => 1]);
+	}
+
+	public function testContainingHandlerErrorsDoesNotReachAnotherFiber()
+	{
+		// A send containing its handler errors waits out a backoff in its fiber; a send in
+		// another fiber meanwhile still sees its own handler's exception.
+		$sender = new TWebhookSender();
+		$sender->setHttpClient($this->_client);
+		$sender->setMaxAttempts(2);
+		$sender->setRetryDelay(20);
+		$sender->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+		$this->answer(new THttpClientResponse(500), new THttpClientResponse(200), new THttpClientResponse(200));
+
+		$future = TAsync::run(fn () => $sender->containingHandlerErrors(fn () => $sender->send(self::URL, ['id' => 1])));
+		$this->assertFalse($future->isComplete(), 'the contained send is waiting out its backoff');
+
+		try {
+			$sender->send(self::URL, ['id' => 2]);
+			$this->fail('the other fiber is not contained');
+		} catch (RuntimeException $e) {
+			$this->assertSame('the handler broke', $e->getMessage());
+		}
+		$deliveries = $future->await();
+		$this->assertSame('the handler broke', $deliveries[0]->getHandlerError(), 'the contained send kept its scope');
 	}
 }

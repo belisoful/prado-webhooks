@@ -98,6 +98,13 @@ if ($mode === 'capture') {
 		$exception->getMessage() !== 'webhooks_secret_required',
 		'an extension error code resolves to its message text'
 	);
+	// The framework formats message file entries as ICU MessageFormat patterns, where a quoted
+	// placeholder is literal text; a message that resolves can still have lost its argument.
+	$exception = new TConfigurationException('webhooks_endpoint_duplicate', 'install-test-id');
+	$check(
+		str_contains($exception->getMessage(), "'install-test-id'"),
+		'an extension message renders its argument in quotes under ICU formatting'
+	);
 	$check(
 		Prado::usingClass('TWebhookModule') === TWebhookModule::class,
 		'the Prado3 short name TWebhookModule resolves through the class map'

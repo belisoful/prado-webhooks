@@ -14,6 +14,8 @@ use Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner;
 use Belisoful\Prado\Web\Webhooks\Signature\TWebhookSignature;
 use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TFiberContext;
+use Prado\IO\HttpClient\TCachedHttpClient;
 use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
 use Prado\TApplicationComponent;
@@ -55,9 +57,6 @@ use Throwable;
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
- * @method void dySending(TWebhookDelivery $delivery)
- * @method void dyDelivered(TWebhookDelivery $delivery)
- * @method void dyFailed(TWebhookDelivery $delivery)
  */
 class TWebhookSender extends TApplicationComponent
 {
@@ -168,10 +167,7 @@ class TWebhookSender extends TApplicationComponent
 		}
 
 		$client = $this->getHttpClient();
-		$client->setTimeout($target->getTimeout() ?: $this->_timeout);
-		// Set on every delivery rather than once when the client is built, so a client an
-		// application substituted cannot follow a 3xx to somewhere the subscriber did not name.
-		$client->setFollowRedirects(false);
+		$timeout = $target->getTimeout() ?: $this->_timeout;
 		$attempts = $target->getMaxAttempts() ?: $this->_maxAttempts;
 		$delay = $target->getRetryDelay() ?: $this->_retryDelay;
 		$started = microtime(true);
@@ -181,6 +177,9 @@ class TWebhookSender extends TApplicationComponent
 			$wait = $this->backoff($delay, $attempt);
 
 			try {
+				// Prepared per attempt, right before the request: a backoff yields the fiber, and
+				// another delivery on the same client may have set its own timeout meanwhile.
+				$this->prepareClient($client, $timeout);
 				// Signed per attempt, not once: a timestamped scheme signs the moment it is
 				// sent, and a signature made before a backoff would be stale by the time the
 				// retry arrives.
@@ -211,6 +210,85 @@ class TWebhookSender extends TApplicationComponent
 	}
 
 	/**
+	 * Sets the timeout on the transport and turns redirects off, on every client a request
+	 * goes through.
+	 *
+	 * Set on every attempt rather than once when the client is built, so a client an
+	 * application substituted cannot follow a 3xx to somewhere the subscriber did not name.
+	 * A {@see \Prado\IO\HttpClient\TCachedHttpClient} keeps its own settings and hands a
+	 * POST straight to the client it wraps, so the settings go to that client as well;
+	 * otherwise a 307 would re-post the signed body to the host it names.
+	 *
+	 * @param \Prado\IO\HttpClient\THttpClient $client the transport.
+	 * @param int $timeout the timeout in seconds.
+	 * @since 0.2.0
+	 */
+	protected function prepareClient(THttpClient $client, int $timeout): void
+	{
+		$seen = [];
+		while (!isset($seen[spl_object_id($client)])) {
+			$seen[spl_object_id($client)] = true;
+			$client->setTimeout($timeout);
+			$client->setFollowRedirects(false);
+			if (!($client instanceof TCachedHttpClient)) {
+				break;
+			}
+			$client = $client->getInner();
+		}
+	}
+
+	/**
+	 * Runs a callback with handler errors contained, for the current fiber only.
+	 *
+	 * {@see setContainHandlerErrors ContainHandlerErrors} is the sender's, and so every
+	 * fiber's: a drain that turned it on and back off while another drain or an inline
+	 * {@see send} ran in a second fiber would switch it under that one -- and a handler error
+	 * after a 2xx would propagate, so an accepted delivery would be sent again. This scope
+	 * lives in the fiber's {@see \Prado\IO\Async\TFiberContext}, so it covers what the
+	 * callback delivers and nothing another fiber does in the meantime.
+	 *
+	 * @param callable $callback what to run.
+	 * @throws \Throwable what the callback throws.
+	 * @return mixed what the callback returns.
+	 * @since 0.2.0
+	 */
+	public function containingHandlerErrors(callable $callback): mixed
+	{
+		$key = $this->containmentKey();
+		$had = TFiberContext::has($key);
+		$previous = TFiberContext::get($key);
+		TFiberContext::set($key, true);
+		try {
+			return $callback();
+		} finally {
+			if ($had) {
+				TFiberContext::set($key, $previous);
+			} else {
+				TFiberContext::remove($key);
+			}
+		}
+	}
+
+	/**
+	 * @return bool whether a handler error is recorded rather than propagated, here: the
+	 *   sender's {@see getContainHandlerErrors ContainHandlerErrors}, or a
+	 *   {@see containingHandlerErrors} scope in the current fiber.
+	 * @since 0.2.0
+	 */
+	protected function isContainingHandlerErrors(): bool
+	{
+		return $this->_containHandlerErrors || TFiberContext::get($this->containmentKey()) === true;
+	}
+
+	/**
+	 * @return string the fiber context key of this sender's containment scope.
+	 */
+	private function containmentKey(): string
+	{
+		return self::class . '::containHandlerErrors#' . spl_object_id($this);
+	}
+
+	/**
 	 * Raises {@see onDelivered} or {@see onFailed}, whichever the delivery earned.
 	 *
 	 * By the time this runs the request has been made and answered, so what a handler does
@@ -234,7 +312,7 @@ class TWebhookSender extends TApplicationComponent
 				$this->onFailed($delivery);
 			}
 		} catch (Throwable $e) {
-			if (!$this->_containHandlerErrors) {
+			if (!$this->isContainingHandlerErrors()) {
 				throw $e;
 			}
 			$delivery->setHandlerError($e->getMessage());
@@ -371,7 +449,7 @@ class TWebhookSender extends TApplicationComponent
 		}
 		if (str_starts_with(strtolower($contentType), TMediaType::FORM)) {
 			if (!is_array($payload) && !is_object($payload)) {
-				throw new TInvalidDataValueException('webhooks_payload_invalid', get_debug_type($payload));
+				throw new TInvalidDataValueException('webhooks_payload_form_invalid', get_debug_type($payload));
 			}
 
 			return http_build_query($payload);
@@ -475,8 +553,14 @@ class TWebhookSender extends TApplicationComponent
 		if ($at === false) {
 			return null;
 		}
+		// The same saturation as the seconds form: `@99999999999999999` is a date strtotime
+		// reads, and its distance from now times a thousand is past what an int holds.
+		$seconds = max(0, $at - time());
+		if ($seconds >= intdiv(PHP_INT_MAX, 1000)) {
+			return PHP_INT_MAX;
+		}
 
-		return max(0, $at - time()) * 1000;
+		return $seconds * 1000;
 	}
 
 	/**
@@ -485,9 +569,11 @@ class TWebhookSender extends TApplicationComponent
 	 *
 	 * The wait is {@see \Prado\IO\Async\TAsync::sleep()}, the framework's one pause: from
 	 * the main fiber it runs the event loop until the timer fires, and from a worker fiber
-	 * -- a cron task drained alongside others, a send started with `TAsync::run()` -- it
-	 * yields, so a backoff holds this delivery and nothing else. A `usleep` here would hold
-	 * every fiber in the process for the length of the backoff.
+	 * -- a send started with `TAsync::run()`, or from a cron task -- it yields, so a backoff
+	 * holds this delivery and nothing else. A `usleep` here would hold every fiber in the
+	 * process for the length of the backoff. The request itself yields only over a client
+	 * that does, such as {@see \Prado\IO\HttpClient\TCurlMultiHttpClient}; the default
+	 * from {@see \Prado\IO\HttpClient\THttpClient::create} blocks.
 	 *
 	 * @param int $milliseconds how long to wait; nothing or less waits not at all.
 	 */
@@ -552,8 +638,9 @@ class TWebhookSender extends TApplicationComponent
 	 * application substitutes a client of its own.
 	 *
 	 * Whatever the client's own `FollowRedirects` says, deliveries do not follow redirects:
-	 * {@see deliver} turns it off on every delivery, because following a 3xx would post the
-	 * signed body somewhere the subscriber did not name.
+	 * {@see deliver} turns it off on every attempt, on the client and on the one a
+	 * {@see \Prado\IO\HttpClient\TCachedHttpClient} wraps, because following a 3xx would
+	 * post the signed body somewhere the subscriber did not name.
 	 *
 	 * @param null|\Prado\IO\HttpClient\THttpClient $value the transport, or null to build the
 	 *   default again on next use.
@@ -649,9 +736,11 @@ class TWebhookSender extends TApplicationComponent
 	 * Sets whether an exception from an {@see onDelivered} or {@see onFailed} handler is
 	 * contained. On, the delivery carries it as its
 	 * {@see TWebhookDelivery::getHandlerError HandlerError} and {@see deliver} returns
-	 * normally; off, it propagates. {@see TWebhookModule::drain} turns this on for the
-	 * length of a run, because the request has already been made by the time a handler runs,
-	 * and an accepted delivery that looked like a failed attempt would be sent again.
+	 * normally; off, it propagates. This is the sender-wide setting, for every fiber;
+	 * {@see TWebhookModule::drain} contains handler errors for its own run through
+	 * {@see containingHandlerErrors} instead, because the request has already been made by
+	 * the time a handler runs, and an accepted delivery that looked like a failed attempt
+	 * would be sent again.
 	 * @param mixed $value whether to contain handler errors.
 	 * @since 0.1.0
 	 */

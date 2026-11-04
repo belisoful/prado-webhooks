@@ -89,9 +89,11 @@ there because no template could produce what it signs:
 - nothing else. RFC 9421 is a specification rather than a vendor, and everything else in the
   wild is configuration.
 
-Every scheme except `TIpWebhookVerifier`, `TSnsWebhookVerifier` and the composites
-implements **both** `IWebhookVerifier` and `IWebhookSigner`, and each runs both directions
-through one place. That is what makes "what this package signs, it verifies" a property
+Every scheme implements `IWebhookVerifier`, and every one but `TIpWebhookVerifier` also
+implements `IWebhookSigner`. `TSnsWebhookVerifier` inherits the signer interface from
+`TPublicKeyWebhookSignature` and refuses in `sign()` with `webhooks_verify_only`, which the
+module also checks at boot; the composites sign with whichever children can. Each scheme
+that does both runs both directions through one place. That is what makes "what this package signs, it verifies" a property
 rather than a promise; keep it that way when adding a scheme.
 
 ## Invariants
@@ -204,8 +206,15 @@ The framework is at `vendor/pradosoft/prado/`, with its own `AGENTS.md`. What ma
 - Application configuration is XML or PHP.
 - PRADO 4.4 runs on an event loop with Fibers (`Prado\IO\Async`). A pause goes through
   `TAsync::sleep()`, never `usleep` or `sleep`: from the main fiber it runs the loop until the
-  timer fires, and from a worker fiber -- a cron task drained alongside others -- it yields.
-  `TWebhookSender::pause()` is the one wait in this package, and that is what it does.
+  timer fires, and from a worker fiber -- a `send()` inside `TAsync::run()` or a cron task --
+  it yields. `TWebhookSender::pause()` is the one wait in this package, and that is what it
+  does. A drain makes one attempt per delivery, so it never pauses; its HTTP request blocks
+  the process unless the sender's `HttpClient` is a `TCurlMultiHttpClient`.
+- `TCronModule` runs tasks in fibers with `Concurrency`, so two drains, or a drain and an
+  inline `send()`, can interleave on the one sender the module owns. Per-call state never
+  goes on the sender or the module: it goes in `TFiberContext`, as
+  `TWebhookSender::containingHandlerErrors()` and the drain's cancellation token do, or is
+  applied per attempt, as the client's timeout is.
 
 ## Testing
 
@@ -215,6 +224,10 @@ The framework is at `vendor/pradosoft/prado/`, with its own `AGENTS.md`. What ma
   about the DDL, the auto-increment spelling, or a repeated placeholder, each of which has
   already been wrong on one server while green on another. Anything touching SQL goes in the
   shared case rather than a subclass, and CI fails when a driver's leg skips.
+- A test that expects a PRADO exception also asserts its code: `expectErrorCode('webhooks_...')`
+  beside `expectException()`, from `tests/test_tools/WebhookErrorCodeAssertions.php`. Every
+  configuration error is a `TConfigurationException`, so the class alone passes on the wrong
+  refusal.
 - Tests are isolated: no shared state between them.
 - When working on one class or cluster, run only those tests with `--filter`.
 

@@ -208,6 +208,8 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 * The second statement of a claim: stamps the lease on the deliveries found, where they
 	 * still qualify.
 	 *
+	 * A row whose previous lease ran out without a write-back has that attempt counted here.
+	 *
 	 * The `WHERE` repeats every condition {@see findDue} had rather than trusting it. The
 	 * lease, so that of two runners stamping the same row exactly one writes it and the
 	 * other simply gets fewer rows back. And that the row is still due: between the two
@@ -222,8 +224,15 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 */
 	protected function stampLease(array $due, string $token, int $now, int $until): void
 	{
+		// A row still carrying a lease token when it is claimed again was last claimed by a
+		// runner that never wrote it back: it died mid-attempt, perhaps on the receiver's
+		// own response. That attempt is counted now, so a delivery that takes its runner down
+		// each time still runs out of attempts. The count is assigned before the token,
+		// because MySQL evaluates a SET left to right and would otherwise read the new token.
 		$command = $this->getDbConnection()->createCommand(
-			'UPDATE ' . $this->_tableName . ' SET leasetoken = :token, leaseduntil = :until, updatedtime = :now'
+			'UPDATE ' . $this->_tableName . ' SET'
+			. ' attempts = attempts + CASE WHEN leasetoken IS NULL THEN 0 ELSE 1 END,'
+			. ' leasetoken = :token, leaseduntil = :until, updatedtime = :now'
 			. ' WHERE tabuid IN (' . implode(', ', array_map('intval', $due)) . ')'
 			. ' AND status = :status AND nextattempt <= :duenow AND leaseduntil <= :leasenow'
 		);
@@ -343,16 +352,10 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	public function remove(TWebhookQueueItem $item): void
 	{
 		$this->ensureTable();
-		$where = $item->getLeaseToken() === null
-			? 'tabuid = :tabuid AND (leasetoken IS NULL OR leaseduntil <= :unleased)'
-			: $this->ownedBy($item);
 		$command = $this->getDbConnection()->createCommand(
-			'DELETE FROM ' . $this->_tableName . ' WHERE ' . $where
+			'DELETE FROM ' . $this->_tableName . ' WHERE ' . $this->ownedBy($item)
 		);
 		$this->bindOwnership($command, $item);
-		if ($item->getLeaseToken() === null) {
-			$command->bindValue(':unleased', time());
-		}
 		$command->execute();
 		$item->setLeaseToken(null);
 	}
@@ -397,9 +400,15 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 			if ($ids === []) {
 				break;
 			}
-			$removed += $this->getDbConnection()->createCommand(
+			// The conditions are repeated: between the two statements a row may have been
+			// set back to pending to replay it, and that row is no longer finished.
+			$delete = $this->getDbConnection()->createCommand(
 				'DELETE FROM ' . $this->_tableName . ' WHERE tabuid IN (' . implode(', ', $ids) . ')'
-			)->execute();
+				. ' AND status <> :pending AND updatedtime < :before'
+			);
+			$delete->bindValue(':pending', TWebhookQueueStatus::Pending->value);
+			$delete->bindValue(':before', $before);
+			$removed += $delete->execute();
 			if (count($ids) < $chunk) {
 				break;
 			}
@@ -437,7 +446,9 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	 * alongside -- or delete the row from under it. Naming the lease in the `WHERE` makes the
 	 * write a no-op instead.
 	 *
-	 * A delivery that was never claimed has no lease to name, so it is addressed by id alone.
+	 * A delivery that was never claimed has no lease to name. It is written only while nobody
+	 * holds a lease on it either, so an application replaying or abandoning a row by id cannot
+	 * release the lease of the runner that is sending it and let a third runner in alongside.
 	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem $item the delivery to write.
 	 * @return string the condition.
@@ -445,7 +456,7 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	protected function ownedBy(TWebhookQueueItem $item): string
 	{
 		return $item->getLeaseToken() === null
-			? 'tabuid = :tabuid'
+			? 'tabuid = :tabuid AND (leasetoken IS NULL OR leaseduntil <= :unleased)'
 			: 'tabuid = :tabuid AND leasetoken = :leasetoken';
 	}
 
@@ -459,6 +470,8 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 		$command->bindValue(':tabuid', $item->getId());
 		if ($item->getLeaseToken() !== null) {
 			$command->bindValue(':leasetoken', $item->getLeaseToken());
+		} else {
+			$command->bindValue(':unleased', time());
 		}
 	}
 
@@ -471,7 +484,7 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 		$spec = json_decode((string) $row['targetspec'], true);
 		$item = new TWebhookQueueItem(
 			is_array($spec) || is_string($spec) ? $spec : [],
-			json_decode((string) $row['payload'], true),
+			$this->decodePayload((string) $row['payload']),
 			$row['eventname'] === null ? null : (string) $row['eventname'],
 			(string) $row['deliveryid']
 		);
@@ -489,6 +502,45 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 	}
 
 	/**
+	 * Decodes a stored payload so that it encodes to the same JSON it was stored as.
+	 *
+	 * Objects come back as arrays, which is what a handler of
+	 * {@see TWebhookModule::onDequeue} reads, except for the two an array cannot stand for:
+	 * an empty object, which as an array encodes as `[]`, and an object keyed `"0"`, `"1"`,
+	 * ... in order, which as an array encodes as a list. Those stay objects, so a queued
+	 * delivery carries the same body an inline one would.
+	 *
+	 * @param string $json the stored payload.
+	 * @return mixed the payload.
+	 * @since 0.2.0
+	 */
+	protected function decodePayload(string $json): mixed
+	{
+		return self::objectsToArrays(json_decode($json));
+	}
+
+	/**
+	 * Converts decoded objects to arrays wherever the array encodes the same.
+	 * @param mixed $value a decoded value.
+	 * @return mixed the value, its objects converted where that is lossless.
+	 */
+	private static function objectsToArrays(mixed $value): mixed
+	{
+		if (is_array($value)) {
+			return array_map([self::class, 'objectsToArrays'], $value);
+		}
+		if (!($value instanceof \stdClass)) {
+			return $value;
+		}
+		$array = array_map([self::class, 'objectsToArrays'], get_object_vars($value));
+		if ($array === [] || array_is_list($array)) {
+			return (object) $array;
+		}
+
+		return $array;
+	}
+
+	/**
 	 * Checks the table is there, creating it when told to.
 	 * @throws \Prado\Exceptions\TConfigurationException when it is missing and this is not
 	 *   allowed to create it.
@@ -503,9 +555,20 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 			$db->createCommand('SELECT * FROM ' . $this->_tableName . ' WHERE 0=1')->query()->close();
 		} catch (Exception $e) {
 			if (!$this->_autoCreateTable) {
-				throw new TConfigurationException('webhooks_queue_table_missing', $this->_tableName, static::class);
+				throw new TConfigurationException('webhooks_queue_table_missing', $this->_tableName, static::class, $e->getMessage());
 			}
-			$this->createTable();
+			try {
+				$this->createTable();
+			} catch (Exception $createError) {
+				// Two runners that both found the table missing race to create it, and the
+				// loser's CREATE INDEX fails on the winner's index. The table being there now
+				// is what matters.
+				try {
+					$db->createCommand('SELECT * FROM ' . $this->_tableName . ' WHERE 0=1')->query()->close();
+				} catch (Exception) {
+					throw $createError;
+				}
+			}
 		}
 		$this->_tableEnsured = true;
 	}
@@ -557,8 +620,9 @@ class TDbWebhookQueue extends TModule implements IWebhookQueue
 		)->execute();
 
 		// The claim reads by the first three together, and the prune by status and age.
-		// No `IF NOT EXISTS`: MySQL has no such clause on CREATE INDEX, and this only runs
-		// when the table was missing, so the indices cannot be there either. The names carry
+		// No `IF NOT EXISTS`: MySQL has no such clause on CREATE INDEX. A runner racing
+		// another to create the table can find the index already made; {@see ensureTable}
+		// accepts that when the table is there afterwards. The names carry
 		// the table's, because PostgreSQL keeps index names per schema rather than per table.
 		foreach ([
 			'_due' => '(status, nextattempt, leaseduntil)',

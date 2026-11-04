@@ -7,6 +7,8 @@ use Prado\Exceptions\TInvalidDataValueException;
 
 class TWebhookQueueItemTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	public function testItCarriesWhatWasQueued()
 	{
 		$item = new TWebhookQueueItem(['url' => 'https://example.com/hook'], ['id' => 1], 'invoice.paid');
@@ -101,6 +103,7 @@ class TWebhookQueueItemTest extends PHPUnit\Framework\TestCase
 	public function testAnUnknownStatusIsRefused()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_queue_status_invalid');
 		(new TWebhookQueueItem('https://example.com/hook'))->setStatus('halfway');
 	}
 
@@ -136,6 +139,7 @@ class TWebhookQueueItemTest extends PHPUnit\Framework\TestCase
 			$item->setDeliveryId(str_repeat('a', TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH + 1));
 			$this->fail('an over-long delivery id should be refused, not truncated into an id nothing else has');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_value_too_long'), $e->getMessage());
 			$this->assertStringContainsString('DeliveryId', $e->getMessage());
 			$this->assertStringContainsString((string) TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH, $e->getMessage());
 		}
@@ -149,6 +153,7 @@ class TWebhookQueueItemTest extends PHPUnit\Framework\TestCase
 		$this->assertSame(TWebhookQueueItem::MAX_EVENT_LENGTH, strlen((string) $item->getEvent()));
 
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_queue_value_too_long');
 		$this->expectExceptionMessage('Event');
 		$item->setEvent(str_repeat('e', TWebhookQueueItem::MAX_EVENT_LENGTH + 1));
 	}
@@ -159,10 +164,12 @@ class TWebhookQueueItemTest extends PHPUnit\Framework\TestCase
 			new TWebhookQueueItem('https://example.com/hook', null, str_repeat('e', TWebhookQueueItem::MAX_EVENT_LENGTH + 1));
 			$this->fail('an over-long event should be refused at construction');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_value_too_long'), $e->getMessage());
 			$this->assertStringContainsString('Event', $e->getMessage());
 		}
 
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_queue_value_too_long');
 		new TWebhookQueueItem('https://example.com/hook', null, null, str_repeat('d', TWebhookQueueItem::MAX_DELIVERY_ID_LENGTH + 1));
 	}
 }

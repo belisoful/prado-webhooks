@@ -9,6 +9,8 @@ use Prado\Exceptions\TInvalidDataValueException;
 
 class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const SECRET = 'It\'s a Secret to Everybody';
 	private const BODY = '{"action":"opened","number":1}';
 
@@ -131,6 +133,7 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setSecretEncoding('base64');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_invalid');
 		$signature->sign($this->request());
 	}
 
@@ -277,6 +280,7 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPayloadFormat('{nonsense}');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_payload_token_unknown');
 		$this->expectExceptionMessage('{nonsense}');
 		$signature->sign($this->request());
 	}
@@ -284,6 +288,7 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testATemplateWithNoTokenIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_payload_format_invalid');
 		(new THmacWebhookSignature())->setPayloadFormat('a fixed string');
 	}
 
@@ -363,6 +368,7 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testAnUnknownBodyDigestAlgorithmIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithm_invalid');
 		(new THmacWebhookSignature())->setBodyHashAlgorithm('rot13');
 	}
 
@@ -559,18 +565,21 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testAnUnkeyableAlgorithmIsRefused()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_algorithm_invalid');
 		(new THmacWebhookSignature())->setAlgorithm('rot13');
 	}
 
 	public function testAnEmptyNameIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_name_required');
 		(new THmacWebhookSignature())->setHeader('  ');
 	}
 
 	public function testSigningWithoutASecretIsAConfigurationError()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		(new THmacWebhookSignature())->sign($this->request());
 	}
 
@@ -579,6 +588,7 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		// A verifier with no secret must not quietly answer false: that would be an endpoint
 		// nobody can reach, reported as a stream of forged requests.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		(new THmacWebhookSignature())->verify($this->request(['X-Webhook-Signature' => 'abc']));
 	}
 
@@ -587,6 +597,7 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		// The same, for a request carrying no signature at all: the configuration is what is
 		// wrong, and it is wrong before the request is looked at.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		(new THmacWebhookSignature())->verify($this->request());
 	}
 
@@ -597,6 +608,37 @@ class THmacWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setSecretEncoding('base64');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_invalid');
 		$signature->verify($this->request());
+	}
+
+	public function testATimestampThatIsNotWholeSecondsIsRefused()
+	{
+		// The bound timestamp is the presented string. Read loosely, `<t>.5` with a body
+		// starting `00` signs the same `{timestamp}.{body}` as `<t>` with one starting `5.00`.
+		$signature = $this->timestamped();
+		$now = (string) time();
+		$signed = $now . '.5.00 charged';
+		$forged = ['X-Webhook-Timestamp' => $now . '.5', 'X-Webhook-Signature' => hash_hmac('sha256', $signed, self::SECRET)];
+
+		$this->assertFalse($signature->verify($this->request($forged, '00 charged')));
+		foreach ([$now . '.0', ' ' . $now, $now . 'e0', '+' . $now, '0x10'] as $timestamp) {
+			$headers = ['X-Webhook-Timestamp' => $timestamp, 'X-Webhook-Signature' => hash_hmac('sha256', $timestamp . '.' . self::BODY, self::SECRET)];
+			$this->assertFalse($signature->verify($this->request($headers)), "'{$timestamp}' is not a timestamp");
+		}
+		$headers = ['X-Webhook-Timestamp' => $now, 'X-Webhook-Signature' => hash_hmac('sha256', $now . '.' . self::BODY, self::SECRET)];
+		$this->assertTrue($signature->verify($this->request($headers)), 'whole seconds still verify');
+	}
+
+	public function testSigningIntoAPostedFieldIsRefused()
+	{
+		// A signer returns headers; a scheme read from the posted fields would send its
+		// signature where the receiver never looks, and every delivery would be refused.
+		$signature = $this->keyed();
+		$signature->setSource('parameter');
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_sign_source_unsupported');
+		$signature->sign($this->request());
 	}
 }

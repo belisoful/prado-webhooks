@@ -22,8 +22,9 @@ It decides whether an inbound webhook is authentic, and signs outbound ones. Wit
   problem: it turns an unreachable endpoint into what looks like a stream of forged requests.
   The package throws in that case, and treats that distinction as part of the contract.
 - **What it does not read.** A delivery is never parsed, logged, or acted on before its
-  signature has been checked -- the body is not decoded until then, and a request whose
-  declared length is over the endpoint's limit is refused before it is read.
+  signature has been checked -- the body is not decoded until then. A request with a method
+  the endpoint refuses, or a declared length over its limit, is refused before the body is
+  read, and a body with no declared length is read only to the limit plus one byte.
 - **Who hears about it.** A refused delivery reaches `onRefused` and never `onWebhook`, so a
   handler on the accepted path cannot be shown a forgery. An endpoint with no verifier
   accepts everything by design; `RequireVerifier` turns that into a configuration error.
@@ -38,6 +39,11 @@ It decides whether an inbound webhook is authentic, and signs outbound ones. Wit
   `onDequeue`; that choice is the application's.
 - **What a handler does with a verified payload.** Verification says the delivery is genuine,
   not that its contents are safe to trust as instructions.
+- **Replays.** A verified delivery can be presented again: inside `Tolerance` for a
+  timestamped scheme, at any age for one without a timestamp. A handler whose work must
+  happen once deduplicates on the provider's delivery id.
+- **Endpoint ids.** An id is not a secret; a known one answers differently from an unknown
+  one. The signature is what guards an endpoint.
 
 ## Supported versions
 

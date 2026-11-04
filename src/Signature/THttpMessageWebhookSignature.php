@@ -409,23 +409,47 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 		if (!is_string($query) || $query === '') {
 			return null;
 		}
-		$wanted = rawurldecode($name);
+		$wanted = self::formDecode($name);
 		$found = null;
 		foreach (explode('&', $query) as $pair) {
 			if ($pair === '') {
 				continue;
 			}
 			[$key, $value] = array_pad(explode('=', $pair, 2), 2, '');
-			if (rawurldecode($key) !== $wanted) {
+			if (self::formDecode($key) !== $wanted) {
 				continue;
 			}
 			if ($found !== null) {
 				return null;
 			}
-			$found = rawurlencode(rawurldecode($value));
+			$found = self::queryParamEncode(self::formDecode($value));
 		}
 
 		return $found;
+	}
+
+	/**
+	 * Decodes a query name or value as `application/x-www-form-urlencoded`, where `+` is a
+	 * space, as RFC 9421 section 2.2.8 parses the query.
+	 * @param string $value the encoded name or value.
+	 * @return string the decoded bytes.
+	 */
+	private static function formDecode(string $value): string
+	{
+		return rawurldecode(str_replace('+', ' ', $value));
+	}
+
+	/**
+	 * Re-encodes a query parameter value as RFC 9421 section 2.2.8 serializes it: the
+	 * WHATWG `application/x-www-form-urlencoded` percent-encode set, with a space as `%20`.
+	 * That set leaves `*`, `-`, `.`, `_` and alphanumerics as they are and encodes `~`,
+	 * which differs from RFC 3986's unreserved set only in those two characters.
+	 * @param string $value the decoded value.
+	 * @return string the encoded value.
+	 */
+	private static function queryParamEncode(string $value): string
+	{
+		return str_replace(['%2A', '~'], ['*', '%7E'], rawurlencode($value));
 	}
 
 	/**
@@ -1116,7 +1140,7 @@ class THttpMessageWebhookSignature extends TWebhookSignature implements IWebhook
 	protected function rawKey(string $key, string $property, int $length): string
 	{
 		if (!function_exists('sodium_crypto_sign_verify_detached')) {
-			throw new TConfigurationException('webhooks_algorithm_unsupported', 'ed25519', static::class);
+			throw new TConfigurationException('webhooks_algorithm_invalid', 'ed25519');
 		}
 		if ($key === '') {
 			throw new TConfigurationException(

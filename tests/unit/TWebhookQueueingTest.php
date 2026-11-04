@@ -17,6 +17,9 @@ use Prado\IO\HttpClient\THttpClient;
 use Prado\IO\HttpClient\THttpClientException;
 use Prado\IO\HttpClient\THttpClientResponse;
 use Prado\TApplicationMode;
+use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TCancellationToken;
+use Prado\IO\Async\TFiberContext;
 
 /**
  * A queue in memory. It proves the contract is implementable by something that is not a
@@ -105,6 +108,8 @@ class TestQueueHttpClient extends THttpClient
 
 class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const URL = 'https://example.com/hooks/prado';
 
 	private TWebhookModule $_module;
@@ -179,6 +184,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$target = TWebhookTarget::ensure(['url' => self::URL, 'secret' => 's3cret']);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_signature_unsupported');
 		$this->_module->queue($target, ['id' => 1]);
 	}
 
@@ -188,6 +194,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$signature->setSecret('s3cret');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_spec_unsupported');
 		$this->_module->queue([['url' => self::URL, 'signature' => $signature]], ['id' => 1]);
 	}
 
@@ -207,6 +214,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 				$this->_module->queue([$spec], ['id' => 1]);
 				$this->fail("an object at {$path} should be refused");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_spec_unsupported'), $e->getMessage());
 				$this->assertStringContainsString($path, $e->getMessage());
 			}
 		}
@@ -218,6 +226,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$target->setData(new THmacWebhookSignature());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_spec_unsupported');
 		$this->expectExceptionMessage('data');
 		$this->_module->queue($target, ['id' => 1]);
 	}
@@ -251,6 +260,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 			$this->_module->queue([self::URL, 'https://other.example/hook', 42], ['id' => 1]);
 			$this->fail('a bad specification should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_target_invalid'), $e->getMessage());
 			$this->assertSame(0, $this->_queue->getCount(), 'nothing was queued');
 		}
 	}
@@ -265,6 +275,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 			], ['id' => 1]);
 			$this->fail('an object in a specification should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_spec_unsupported'), $e->getMessage());
 			$this->assertSame(0, $this->_queue->getCount());
 		}
 	}
@@ -277,6 +288,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 			$this->_module->queue([self::URL, 'https://other.example/hook'], ['bad' => fopen('php://memory', 'r')]);
 			$this->fail('a resource cannot be written down');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_payload_invalid'), $e->getMessage());
 			$this->assertSame(0, $this->_queue->getCount());
 		}
 	}
@@ -285,6 +297,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 	{
 		// json_encode refuses it, so the queue could not have stored it either.
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_payload_invalid');
 		$this->_module->queue(self::URL, "\xB1\x31");
 	}
 
@@ -294,6 +307,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 			$this->_module->queue([['url' => self::URL, 'contentType' => 'application/x-www-form-urlencoded']], 42);
 			$this->fail('a form needs fields');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_payload_form_invalid'), $e->getMessage());
 			$this->assertSame(0, $this->_queue->getCount());
 		}
 
@@ -308,6 +322,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 			$this->_module->queue([self::URL, 'https://other.example/hook'], ['id' => 1], str_repeat('e', 191));
 			$this->fail('an over-long event should be refused');
 		} catch (TInvalidDataValueException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_queue_value_too_long'), $e->getMessage());
 			$this->assertSame(0, $this->_queue->getCount());
 		}
 	}
@@ -318,6 +333,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 
 		$this->assertFalse($module->getHasQueue());
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_required');
 		$module->queue(self::URL, ['id' => 1]);
 	}
 
@@ -917,6 +933,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 			$task->getWebhookModule();
 			$this->fail('there is no module to find');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_task_module_invalid'), $e->getMessage());
 			$this->assertStringContainsString(TWebhookModule::DEFAULT_MODULE_ID, $e->getMessage());
 		}
 	}
@@ -932,6 +949,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$task->setModuleId('not-the-webhooks');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_task_module_invalid');
 		$task->getWebhookModule();
 	}
 
@@ -941,6 +959,7 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 		$module->setQueueID('nothing-by-that-name');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_queue_invalid');
 		$module->getQueue();
 	}
 
@@ -1007,5 +1026,126 @@ class TWebhookQueueingTest extends PHPUnit\Framework\TestCase
 
 		$this->assertCount(0, $this->_queue->abandoned);
 		$this->assertCount(1, $this->_queue->rescheduled);
+	}
+
+	public function testADrainsContainmentDoesNotReachASendInAnotherFiber()
+	{
+		// The sender is the module's and every fiber's. A drain that turned its
+		// ContainHandlerErrors on and back off swallowed the handler errors of an inline send
+		// in another fiber, and could switch containment off under a second drain.
+		$client = new class () extends TestQueueHttpClient {
+			public function download(string $method, string $url, array $headers = [], ?string $body = null): THttpClientResponse
+			{
+				if (str_contains($url, 'slow')) {
+					TAsync::sleep(0.02);
+				}
+
+				return parent::download($method, $url, $headers, $body);
+			}
+		};
+		$sender = $this->_module->getSender();
+		$sender->setHttpClient($client);
+		$sender->onDelivered[] = function () {
+			throw new RuntimeException('the handler broke');
+		};
+		$this->_module->queue('https://example.com/slow', ['id' => 1]);
+
+		$drain = TAsync::run(fn () => $this->_module->drain());
+		$this->assertFalse($drain->isComplete(), 'the drain is waiting on its request');
+		$this->assertFalse($sender->getContainHandlerErrors(), 'the sender-wide setting is never changed');
+
+		try {
+			$this->_module->send(self::URL, ['id' => 2]);
+			$this->fail('a send outside the drain propagates its handler error');
+		} catch (RuntimeException $e) {
+			$this->assertSame('the handler broke', $e->getMessage());
+		}
+		$deliveries = $drain->await();
+		$this->assertSame('the handler broke', $deliveries[0]->getHandlerError(), 'the drain contained its own');
+		$this->assertCount(1, $this->_queue->succeeded);
+	}
+
+	public function testADeliveryThatHasHadEveryAttemptWhenClaimedIsAbandonedWithoutAnother()
+	{
+		// A queue counts an attempt whose runner never reported back. A delivery that takes its
+		// runner down every time reaches its limit that way, and settles instead of going out
+		// again to do it once more.
+		$item = $this->_module->queue(self::URL, ['id' => 1])[0];
+		$item->setAttempts($this->_module->getQueueMaxAttempts());
+
+		$this->assertSame([], $this->_module->drain());
+
+		$this->assertSame([], $this->_client->requests);
+		$this->assertSame([$item], $this->_queue->abandoned);
+		$this->assertSame(TWebhookModule::STATUS_UNREPORTED, $item->getLastStatus());
+	}
+
+	public function testACancelledRunReleasesWhatItHasNotAttempted()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_module->queue(self::URL, ['id' => 1]);
+		$second = $this->_module->queue(self::URL, ['id' => 2])[0];
+		$token = new TCancellationToken();
+		$this->_module->getSender()->onDelivered[] = function () use ($token) {
+			$token->cancel();
+		};
+
+		TFiberContext::set(TWebhookModule::CANCELLATION_CONTEXT_KEY, $token);
+		try {
+			$deliveries = $this->_module->drain();
+		} finally {
+			TFiberContext::remove(TWebhookModule::CANCELLATION_CONTEXT_KEY);
+		}
+
+		$this->assertCount(1, $deliveries, 'the delivery in flight finished');
+		$this->assertCount(1, $this->_client->requests);
+		$this->assertSame([[$second, 0]], $this->_queue->rescheduled, 'the rest goes back at once');
+		$this->assertSame(0, $second->getAttempts(), 'without costing an attempt');
+		$this->assertSame(TWebhookModule::STATUS_RELEASED, $second->getLastStatus());
+	}
+
+	public function testTheCronTaskHandsItsRunsDeadlineToTheDrain()
+	{
+		$this->_module->queue(self::URL, ['id' => 1]);
+		$token = new TCancellationToken();
+		$token->cancel();
+		$task = new class ($this->_module) extends TWebhookCronTask {
+			public function __construct(private TWebhookModule $_webhooks)
+			{
+				parent::__construct();
+			}
+
+			public function getWebhookModule(): TWebhookModule
+			{
+				return $this->_webhooks;
+			}
+		};
+		$task->setCancellationToken($token);
+
+		$this->assertSame([], $task->execute(null));
+
+		$this->assertSame([], $this->_client->requests, 'a run already past its deadline sends nothing');
+		$this->assertCount(1, $this->_queue->rescheduled);
+		$this->assertFalse(TFiberContext::has(TWebhookModule::CANCELLATION_CONTEXT_KEY), 'the fiber context is restored');
+	}
+
+	public function testTheCronTaskWithoutADeadlineDrainsEverything()
+	{
+		$this->answer(new THttpClientResponse(200));
+		$this->_module->queue(self::URL, ['id' => 1]);
+		$this->_module->queue(self::URL, ['id' => 2]);
+		$task = new class ($this->_module) extends TWebhookCronTask {
+			public function __construct(private TWebhookModule $_webhooks)
+			{
+				parent::__construct();
+			}
+
+			public function getWebhookModule(): TWebhookModule
+			{
+				return $this->_webhooks;
+			}
+		};
+
+		$this->assertCount(2, $task->execute(null));
 	}
 }

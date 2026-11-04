@@ -30,6 +30,8 @@ class TestRecordingVerifier implements IWebhookVerifier
 
 class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const BODY = '{"id":1}';
 
 	private function request(array $headers = [], ?string $remote = null): TWebhookRequest
@@ -129,6 +131,7 @@ class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$all->addSignature(new TIpWebhookVerifier());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_signers_required');
 		$all->sign($this->request());
 	}
 
@@ -138,6 +141,7 @@ class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$any->addSignature(new TIpWebhookVerifier());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_signers_required');
 		$any->sign($this->request());
 	}
 
@@ -184,12 +188,14 @@ class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$any = new TAnyWebhookSignature();
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_invalid');
 		$any->init($this->xml('<signature><signature class="Prado\TComponent" /></signature>'));
 	}
 
 	public function testAddingSomethingThatIsNeitherIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_invalid');
 		(new TAnyWebhookSignature())->addSignature(new stdClass());
 	}
 
@@ -201,6 +207,7 @@ class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 				$composite->verify($this->request());
 				$this->fail($composite::class . ' should refuse to verify with no children');
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_signatures_required'), $e->getMessage());
 				$this->assertNotSame('', $e->getMessage());
 			}
 		}
@@ -288,6 +295,7 @@ class TCompositeWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$any->addSignature(new THmacWebhookSignature());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$any->verify($this->request());
 	}
 }

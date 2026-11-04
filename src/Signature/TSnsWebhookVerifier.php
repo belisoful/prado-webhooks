@@ -55,8 +55,13 @@ use Prado\TPropertyValue;
  * topic's deliveries, and let the handler deduplicate on `MessageId` for what is left.
  *
  * The certificate URL is fetched only after the message has presented a `Signature`, and
- * only when it names a `.pem` path on an SNS host with no query string -- the same shape
- * Amazon's own validator requires -- so a body with no signature never causes a fetch.
+ * only when it names Amazon's own certificate file, `SimpleNotificationService-<hex>.pem`,
+ * on an SNS host with no query string, so a body with no signature never causes a fetch.
+ * A caller who knows the topic can still make each forged message fetch a new name from
+ * Amazon, since a failed fetch is not cached. A
+ * {@see \Belisoful\Prado\Web\Webhooks\Signature\TAllWebhookSignature} evaluates every
+ * child, so an address allow list beside this one does not prevent the fetch; rate limiting
+ * in front of the application does.
  *
  * Every field is read defensively: a value of the wrong type -- a list where a string is
  * expected, an object as the version -- refuses the message rather than raising an error
@@ -71,11 +76,11 @@ use Prado\TPropertyValue;
 class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 {
 	/**
-	 * The URLs a signing certificate may be fetched from: an SNS host, a `.pem` path, and
-	 * no query string or fragment, which is what Amazon's own validator requires.
+	 * The URLs a signing certificate may be fetched from: an SNS host, Amazon's
+	 * `SimpleNotificationService-<hex>.pem` file name, and no query string or fragment.
 	 * @var string
 	 */
-	public const DEFAULT_CERTIFICATE_URL_PATTERN = '#^https://sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/[^?\#]+\.pem$#D';
+	public const DEFAULT_CERTIFICATE_URL_PATTERN = '#^https://sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/SimpleNotificationService-[0-9a-f]+\.pem$#D';
 
 	/** @var array<string, string[]> the fields each message type signs, in the order it signs them. */
 	public const SIGNED_FIELDS = [
@@ -169,7 +174,7 @@ class TSnsWebhookVerifier extends TPublicKeyWebhookSignature
 	 */
 	public function sign(TWebhookRequest $request): array
 	{
-		throw new TConfigurationException('webhooks_sign_source_unsupported', 'body', static::class);
+		throw new TConfigurationException('webhooks_verify_only', static::class);
 	}
 
 	/**

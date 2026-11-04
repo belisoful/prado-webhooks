@@ -5,6 +5,8 @@ use Prado\Exceptions\TInvalidDataValueException;
 
 class TWebhookEncodingTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private function raw(): string
 	{
 		return hash_hmac('sha256', 'body', 'secret', true);
@@ -99,6 +101,7 @@ class TWebhookEncodingTest extends PHPUnit\Framework\TestCase
 	public function testEnsureRejectsAnUnknownName()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_encoding_invalid');
 		$this->expectExceptionMessage('base32');
 		TWebhookEncoding::ensure('base32');
 	}

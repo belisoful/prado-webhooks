@@ -10,6 +10,7 @@
 
 namespace Belisoful\Prado\Web\Webhooks;
 
+use Belisoful\Prado\Web\Webhooks\Signature\TCompositeWebhookSignature;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Prado;
 use Prado\Xml\TXmlElement;
@@ -67,8 +68,8 @@ trait TWebhookConfigurationTrait
 	 * @param mixed $config this component's own configuration.
 	 * @param string $tag the child element name, or array key, to collect.
 	 * @throws \Prado\Exceptions\TConfigurationException when a child declares no id -- an
-	 *   XML element without the attribute, or a PHP child keyed by a number -- or a PHP
-	 *   child is not an array.
+	 *   XML element without the attribute, or a PHP child keyed by a number -- two XML
+	 *   children declare the same id, or a PHP child is not an array.
 	 * @return array<string, array<string, mixed>|\Prado\Xml\TXmlElement> id => configuration.
 	 */
 	protected function childConfigurations(mixed $config, string $tag): array
@@ -79,6 +80,10 @@ trait TWebhookConfigurationTrait
 				$id = $child->getAttribute('id');
 				if ($id === null || $id === '') {
 					throw new TConfigurationException('webhooks_child_id_required', $tag, static::class);
+				}
+				if (isset($children[$id])) {
+					// The later element would replace the earlier one, verifier and all.
+					throw new TConfigurationException('webhooks_child_id_duplicate', $tag, $id, static::class);
 				}
 				$children[$id] = $child;
 			}
@@ -148,7 +153,7 @@ trait TWebhookConfigurationTrait
 		}
 		if (is_array($config) && array_key_exists($tag, $config)) {
 			if (!is_array($config[$tag])) {
-				throw new TConfigurationException('webhooks_child_invalid', $tag, $tag, static::class);
+				throw new TConfigurationException('webhooks_child_not_array', $tag, static::class);
 			}
 
 			return $config[$tag];
@@ -158,18 +163,25 @@ trait TWebhookConfigurationTrait
 	}
 
 	/**
-	 * Creates a component from a child configuration and applies its properties.
+	 * Creates a component from a child configuration and applies its properties. A composite
+	 * scheme is given its own `signature` children from the same configuration.
 	 *
 	 * @param null|array<string, mixed>|\Prado\Xml\TXmlElement $config the child configuration.
 	 * @param string|string[] $type the type, or any one of the types, the result must be an
 	 *   instance of.
 	 * @param null|string $default the class to create when the configuration names none; null
 	 *   makes `class` required.
+	 * @param bool $strictKeys whether a PHP configuration may hold only `class`, `properties`,
+	 *   and, for a composite scheme, its `signature` children. A property written beside
+	 *   `class` rather than inside `properties` is otherwise ignored, and for a scheme that
+	 *   drops a check: a JWT `Audience` there leaves the audience unchecked. XML cannot make
+	 *   this mistake, since every attribute is a property.
 	 * @throws \Prado\Exceptions\TConfigurationException when no class is named and there is no
-	 *   default, or the created component is not a $type.
+	 *   default, the created component is not a $type, or a strict PHP configuration holds a
+	 *   key it does not read.
 	 * @return object the configured component.
 	 */
-	protected function createConfigured(null|array|TXmlElement $config, string|array $type, ?string $default = null): object
+	protected function createConfigured(null|array|TXmlElement $config, string|array $type, ?string $default = null, bool $strictKeys = false): object
 	{
 		$properties = [];
 		$class = $default;
@@ -194,11 +206,26 @@ trait TWebhookConfigurationTrait
 		if (!$matched) {
 			throw new TConfigurationException('webhooks_component_invalid', $class, implode(' or ', $accepted));
 		}
+		if ($strictKeys && is_array($config)) {
+			$known = ['class', 'properties'];
+			if ($component instanceof TCompositeWebhookSignature) {
+				$known[] = 'signature';
+			}
+			$unknown = array_diff(array_map('strval', array_keys($config)), $known);
+			if ($unknown !== []) {
+				throw new TConfigurationException('webhooks_property_misplaced', implode(', ', $unknown), $class);
+			}
+		}
 		foreach ($properties as $name => $value) {
 			if (strcasecmp((string) $name, 'id') === 0) {
 				continue;
 			}
 			$component->setSubproperty((string) $name, $value);
+		}
+		if ($component instanceof TCompositeWebhookSignature) {
+			// A composite's children are in the same configuration; built without them, it
+			// throws on its first delivery.
+			$component->init($config);
 		}
 
 		return $component;

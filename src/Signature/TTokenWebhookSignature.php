@@ -82,6 +82,16 @@ class TTokenWebhookSignature extends TWebhookSignature implements IWebhookVerifi
 		if ($presented === null || !$this->bodyHashHolds($request)) {
 			return false;
 		}
+		// The prefix is an authentication scheme, which RFC 9110 makes case-insensitive:
+		// `bearer <token>` is the same credential as `Bearer <token>`. It is no secret, so
+		// it is matched first and the token alone compared in constant time.
+		$prefix = $this->getPrefix();
+		if ($prefix !== '') {
+			if (strncasecmp($presented, $prefix, strlen($prefix)) !== 0) {
+				return false;
+			}
+			$presented = $prefix . substr($presented, strlen($prefix));
+		}
 
 		return hash_equals($expected, $presented);
 	}
@@ -96,12 +106,10 @@ class TTokenWebhookSignature extends TWebhookSignature implements IWebhookVerifi
 	 */
 	public function sign(TWebhookRequest $request): array
 	{
-		if ($this->getHeader() === null) {
-			// A signer returns headers; a token that lives in the URL has to be part of the
-			// target's URL instead, and silently dropping it would send an unauthenticated
-			// delivery that looks signed.
-			throw new TConfigurationException('webhooks_sign_source_unsupported', $this->getSource()->value, static::class);
-		}
+		// A signer returns headers; a token that lives in the URL has to be part of the
+		// target's URL instead, and silently dropping it would send an unauthenticated
+		// delivery that looks signed.
+		$this->assertSignsInHeader();
 
 		return [$this->getName() => $this->presentedValue()];
 	}

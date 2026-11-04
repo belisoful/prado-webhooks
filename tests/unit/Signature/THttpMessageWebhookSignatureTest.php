@@ -6,6 +6,8 @@ use Prado\Exceptions\TConfigurationException;
 
 class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const SECRET = 'a shared signing secret';
 	private const BODY = '{"hello": "world"}';
 	private const URL = 'https://example.com/index.php?webhook=provider';
@@ -355,6 +357,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$headers['Signature'] = 'sig1=:' . base64_encode(str_repeat('A', SODIUM_CRYPTO_SIGN_BYTES)) . ':';
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$verifier->verify($this->request($headers));
 	}
 
@@ -421,6 +424,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setRequiredComponents('@method, x-tenant');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_missing');
 		$signature->sign($this->request());
 	}
 
@@ -589,11 +593,17 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 	public function testAnEmptyOrUnknownAlgorithmListIsRefused()
 	{
-		foreach ([' , ', 'rsa-pss-oaep', 'made-up'] as $value) {
+		$codes = [
+			' , ' => 'webhooks_algorithms_required',
+			'rsa-pss-oaep' => 'webhooks_algorithm_unsupported',
+			'made-up' => 'webhooks_algorithm_unsupported',
+		];
+		foreach ($codes as $value => $code) {
 			try {
 				(new THttpMessageWebhookSignature())->setAlgorithms($value);
 				$this->fail("'{$value}' should be refused");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex($code), $e->getMessage());
 				$this->assertNotSame('', $e->getMessage());
 			}
 		}
@@ -602,12 +612,14 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testAnEmptyComponentListIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_components_required');
 		(new THttpMessageWebhookSignature())->setRequiredComponents(' , ');
 	}
 
 	public function testAnUnknownDigestAlgorithmIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithm_unsupported');
 		(new THttpMessageWebhookSignature())->setDigestAlgorithm('md5');
 	}
 
@@ -617,6 +629,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signed = $this->signed($this->hmac());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$signature->verify($signed);
 	}
 
@@ -627,8 +640,9 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	 * @param string $algorithm
 	 * @param string $property
 	 * @param string $material
+	 * @param string $code the error code the refusal carries.
 	 */
-	public function testAnUnusableKeyIsAConfigurationError(string $algorithm, string $property, string $material)
+	public function testAnUnusableKeyIsAConfigurationError(string $algorithm, string $property, string $material, string $code)
 	{
 		$signature = new THttpMessageWebhookSignature();
 		$signature->setAlgorithms($algorithm);
@@ -638,6 +652,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		}
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode($code);
 		if ($property === 'PrivateKey') {
 			$signature->sign($this->request());
 
@@ -655,14 +670,14 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$rubbish = "-----BEGIN PUBLIC KEY-----\nQUJD\n-----END PUBLIC KEY-----";
 
 		return [
-			'rsa, no key at all' => ['rsa-v1_5-sha256', 'PublicKey', ''],
-			'rsa, unreadable key' => ['rsa-v1_5-sha256', 'PublicKey', $rubbish],
-			'pss, an EC key' => ['rsa-pss-sha512', 'PublicKey', $ecPublic],
-			'pss, unreadable key' => ['rsa-pss-sha512', 'PublicKey', $rubbish],
-			'rsa, no private key' => ['rsa-v1_5-sha256', 'PrivateKey', ''],
-			'rsa, unreadable private key' => ['rsa-v1_5-sha256', 'PrivateKey', $rubbish],
-			'pss, an EC private key' => ['rsa-pss-sha512', 'PrivateKey', (string) $ecPrivate],
-			'ecdsa, no key' => ['ecdsa-p256-sha256', 'PublicKey', ''],
+			'rsa, no key at all' => ['rsa-v1_5-sha256', 'PublicKey', '', 'webhooks_public_key_required'],
+			'rsa, unreadable key' => ['rsa-v1_5-sha256', 'PublicKey', $rubbish, 'webhooks_key_invalid'],
+			'pss, an EC key' => ['rsa-pss-sha512', 'PublicKey', $ecPublic, 'webhooks_pss_key_invalid'],
+			'pss, unreadable key' => ['rsa-pss-sha512', 'PublicKey', $rubbish, 'webhooks_pss_key_invalid'],
+			'rsa, no private key' => ['rsa-v1_5-sha256', 'PrivateKey', '', 'webhooks_private_key_required'],
+			'rsa, unreadable private key' => ['rsa-v1_5-sha256', 'PrivateKey', $rubbish, 'webhooks_key_invalid'],
+			'pss, an EC private key' => ['rsa-pss-sha512', 'PrivateKey', (string) $ecPrivate, 'webhooks_pss_key_invalid'],
+			'ecdsa, no key' => ['ecdsa-p256-sha256', 'PublicKey', '', 'webhooks_public_key_required'],
 		];
 	}
 
@@ -688,6 +703,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signer->setPrivateKey(self::$rsa['private']);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_signing_failed');
 		$signer->sign($this->request());
 	}
 
@@ -697,6 +713,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setAlgorithms('rsa-v1_5-sha256');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_private_key_required');
 		$signature->sign($this->request());
 	}
 
@@ -1099,6 +1116,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setRequiredComponents('@query-param;name="id"');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_missing');
 		$signature->sign(new TWebhookRequest('POST', self::BODY, [], 'https://example.com/hook?other=1'));
 	}
 
@@ -1199,6 +1217,7 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$verifier->setAlgorithms('hmac-sha256, hmac-sha512');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="hmac-sha256"')));
 	}
 
@@ -1208,12 +1227,14 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$verifier->setAlgorithms('rsa-v1_5-sha256, hmac-sha256');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="hmac-sha256"')));
 	}
 
 	public function testVerifyingWithoutAnyKeyIsAConfigurationErrorEvenWhenNothingIsPresented()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		(new THttpMessageWebhookSignature())->verify($this->request());
 	}
 
@@ -1257,6 +1278,34 @@ class THttpMessageWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$verifier->setPublicKey(self::$p256['public']);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$verifier->verify($this->request($this->headersWithParameters(';created=' . time() . ';alg="rsa-v1_5-sha256"')));
+	}
+
+	public function testAQueryParameterIsCanonicalizedAsRfc9421Says()
+	{
+		// RFC 9421 section 2.2.8 parses the query as a form, so `+` is a space, and serializes
+		// it with the form percent-encode set: a space is %20, `~` is encoded and `*` is not.
+		// The RFC's own example is the first case.
+		$signature = $this->hmac();
+		$signature->setRequiredComponents('@query-param;name="bar"');
+		foreach ([
+			['bar=with+plus+whitespace', 'with%20plus%20whitespace'],
+			['bar=a~b*c', 'a%7Eb*c'],
+			['bar=%E2%82%AC%2B', '%E2%82%AC%2B'],
+		] as [$query, $canonical]) {
+			$headers = $this->handSigned(['"@query-param";name="bar"' => $canonical], ';created=' . time() . ';keyid="prado"');
+			$this->assertTrue(
+				$signature->verify(new TWebhookRequest('POST', self::BODY, $headers, 'https://example.com/h?' . $query)),
+				"{$query} canonicalizes to {$canonical}"
+			);
+		}
+
+		$headers = $this->handSigned(['"@query-param";name="fa%C3%A7ade%22%3A%20"' => 'something'], ';created=' . time() . ';keyid="prado"');
+		$signature->setRequiredComponents('@query-param;name="fa%C3%A7ade%22%3A%20"');
+		$this->assertTrue(
+			$signature->verify(new TWebhookRequest('POST', self::BODY, $headers, 'https://example.com/h?fa%C3%A7ade%22%3A+=something')),
+			'a name is decoded as a form too'
+		);
 	}
 }

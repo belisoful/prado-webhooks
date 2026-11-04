@@ -28,6 +28,8 @@ class TestWebhookVerifier implements IWebhookVerifier
 
 class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const BODY = '{"action":"opened","repository":{"full_name":"belisoful/prado"}}';
 
 	private TWebhookEndpoint $_endpoint;
@@ -94,6 +96,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 	public function testAnEmptyMethodListIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_methods_required');
 		$this->_endpoint->setMethods(' , ');
 	}
 
@@ -332,6 +335,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$xml->loadFromString('<endpoint id="x"><signature class="Prado\TComponent" /></endpoint>');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_invalid');
 		$this->_endpoint->init($xml);
 	}
 
@@ -341,6 +345,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$xml->loadFromString('<endpoint id="x"><signature Secret="s3cret" /></endpoint>');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_class_required');
 		$this->_endpoint->init($xml);
 	}
 
@@ -447,6 +452,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$param = new TWebhookEventParameter($this->_endpoint, new TWebhookRequest('POST', '{}'));
 
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_response_invalid');
 		$param->setResponseBody(['bad' => "\xB1\x31"]);
 	}
 
@@ -475,6 +481,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$this->assertSame(299, $param->getStatusCode());
 
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_status_invalid');
 		$param->setStatusCode(0);
 	}
 
@@ -482,6 +489,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 	{
 		// "ok" would coerce to 0 and become an error page on every accepted delivery.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_status_invalid');
 		$this->_endpoint->setSuccessStatus('ok');
 	}
 
@@ -494,12 +502,14 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_unknown');
 		$this->_endpoint->init($xml);
 	}
 
 	public function testAnUnknownPhpChildKeyIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_unknown');
 		$this->_endpoint->init(['signatrue' => ['class' => THmacWebhookSignature::class]]);
 	}
 
@@ -510,6 +520,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$xml->loadFromString('<endpoint id="x" />');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verifier_required');
 		$this->_endpoint->init($xml);
 	}
 
@@ -519,6 +530,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		$this->assertTrue($this->_endpoint->getRequireVerifier());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verifier_required');
 		$this->handle('POST', '{}');
 	}
 
@@ -535,12 +547,14 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		// A class name where the array holding one was meant would otherwise build an
 		// endpoint with no verifier, which accepts everything.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_not_array');
 		$this->_endpoint->init(['signature' => THmacWebhookSignature::class]);
 	}
 
 	public function testAPhpSignatureChildThatIsNullIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_not_array');
 		$this->_endpoint->init(['signature' => null]);
 	}
 
@@ -557,6 +571,7 @@ class TWebhookEndpointTest extends PHPUnit\Framework\TestCase
 		);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_duplicate');
 		$this->_endpoint->init($xml);
 	}
 }

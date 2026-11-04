@@ -24,6 +24,8 @@ class TestSnsHttpClient extends THttpClient
 
 class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const TOPIC = 'arn:aws:sns:us-east-1:123456789012:my-topic';
 	private const CERT_URL = 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem';
 
@@ -203,9 +205,9 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 	public function testTheDefaultCertificatePatternAcceptsAnyRegionAndChina()
 	{
 		foreach ([
-			'https://sns.us-east-1.amazonaws.com/cert.pem',
-			'https://sns.eu-west-3.amazonaws.com/cert.pem',
-			'https://sns.cn-north-1.amazonaws.com.cn/cert.pem',
+			'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
+			'https://sns.eu-west-3.amazonaws.com/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
+			'https://sns.cn-north-1.amazonaws.com.cn/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
 		] as $url) {
 			$this->assertMatchesRegularExpression(
 				TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN,
@@ -213,9 +215,12 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 			);
 		}
 		foreach ([
-			'http://sns.us-east-1.amazonaws.com/cert.pem',
-			'https://sns.us-east-1.amazonaws.com.attacker.net/cert.pem',
-			'https://attacker.net/sns.us-east-1.amazonaws.com/cert.pem',
+			'http://sns.us-east-1.amazonaws.com/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
+			'https://sns.us-east-1.amazonaws.com.attacker.net/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
+			'https://attacker.net/sns.us-east-1.amazonaws.com/SimpleNotificationService-6aad65c2f9911b05cd53efda11f913f9.pem',
+			// Any other file on the host: an attacker cannot point the fetch at an arbitrary path.
+			'https://sns.us-east-1.amazonaws.com/cert.pem',
+			'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-../x.pem',
 		] as $url) {
 			$this->assertDoesNotMatchRegularExpression(
 				TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN,
@@ -255,6 +260,7 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 	{
 		// The signature belongs in the body, and a signer returns headers.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verify_only');
 		$this->verifier()->sign($this->request($this->message()));
 	}
 
@@ -264,24 +270,28 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 		$verifier->setHttpClient($this->_client);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_topic_required');
 		$verifier->verify($this->request($this->message()));
 	}
 
 	public function testAnEmptyTopicIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_topic_required');
 		(new TSnsWebhookVerifier())->setTopicArn(' , ');
 	}
 
 	public function testAnEmptyOrUnknownSignatureVersionListIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithm_unsupported');
 		(new TSnsWebhookVerifier())->setSignatureVersions('3');
 	}
 
 	public function testAnEmptySignatureVersionListIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithms_required');
 		(new TSnsWebhookVerifier())->setSignatureVersions(' , ');
 	}
 
@@ -569,5 +579,12 @@ class TSnsWebhookVerifierTest extends PHPUnit\Framework\TestCase
 		// `$` without D matches before a final newline, and the URL is what gets fetched.
 		$this->assertSame(1, preg_match(TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN, 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem'));
 		$this->assertSame(0, preg_match(TSnsWebhookVerifier::DEFAULT_CERTIFICATE_URL_PATTERN, "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem\n"));
+	}
+
+	public function testSigningSaysTheSchemeOnlyVerifies()
+	{
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verify_only');
+		$this->verifier()->sign(new TWebhookRequest('POST', '{}', []));
 	}
 }

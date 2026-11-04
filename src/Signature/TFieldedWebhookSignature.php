@@ -177,11 +177,13 @@ class TFieldedWebhookSignature extends THmacWebhookSignature
 	 * signing by hand without setting `IdName` gets a fresh id per call, as before.
 	 *
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request about to be made.
-	 * @throws \Prado\Exceptions\TConfigurationException when the scheme is not configured.
+	 * @throws \Prado\Exceptions\TConfigurationException when the scheme is not configured, or
+	 *   its signature is read from somewhere other than a header.
 	 * @return array<string, string> the one packed header.
 	 */
 	public function sign(TWebhookRequest $request): array
 	{
+		$this->assertSignsInHeader();
 		$bound = ['timestamp' => (string) time(), 'id' => ''];
 		$fields = [$this->_timestampField . $this->_valueSeparator . $bound['timestamp']];
 

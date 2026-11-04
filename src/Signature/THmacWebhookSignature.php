@@ -96,12 +96,14 @@ class THmacWebhookSignature extends TWebhookSignature implements IWebhookVerifie
 	/**
 	 * Signs an outbound request, producing headers an identically configured verifier accepts.
 	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookRequest $request the request about to be made.
-	 * @throws \Prado\Exceptions\TConfigurationException when the scheme is not configured.
+	 * @throws \Prado\Exceptions\TConfigurationException when the scheme is not configured, or
+	 *   its signature is read from somewhere other than a header.
 	 * @return array<string, string> the signature header, plus the timestamp and id headers
 	 *   when the scheme names them.
 	 */
 	public function sign(TWebhookRequest $request): array
 	{
+		$this->assertSignsInHeader();
 		$bound = ['timestamp' => '', 'id' => ''];
 		if ($this->getTimestampName() !== null) {
 			$bound['timestamp'] = (string) time();

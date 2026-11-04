@@ -6,6 +6,8 @@ use Prado\Exceptions\TConfigurationException;
 
 class TTokenWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private function request(array $headers = [], string $body = '', string $url = '', array $parameters = []): TWebhookRequest
 	{
 		return new TWebhookRequest('POST', $body, $headers, $url, $parameters);
@@ -110,6 +112,7 @@ class TTokenWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setName('key');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_sign_source_unsupported');
 		$signature->sign($this->request());
 	}
 
@@ -125,12 +128,14 @@ class TTokenWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testAnEmptyNameIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_name_required');
 		(new TTokenWebhookSignature())->setHeader('');
 	}
 
 	public function testVerifyingWithoutATokenIsAConfigurationError()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_token_required');
 		(new TTokenWebhookSignature())->verify($this->request(['Authorization' => 'Bearer anything']));
 	}
 
@@ -138,12 +143,26 @@ class TTokenWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	{
 		// A verifier with no token must not degrade into one that quietly refuses everything.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_token_required');
 		(new TTokenWebhookSignature())->verify($this->request());
 	}
 
 	public function testSigningWithoutATokenIsAConfigurationError()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_token_required');
 		(new TTokenWebhookSignature())->sign($this->request());
+	}
+
+	public function testTheAuthenticationSchemeIsMatchedWithoutRegardToCase()
+	{
+		// RFC 9110 makes the scheme case-insensitive; the token itself is not.
+		$signature = $this->bearer();
+
+		$this->assertTrue($signature->verify($this->request(['Authorization' => 'bearer sh4red'])));
+		$this->assertTrue($signature->verify($this->request(['Authorization' => 'BEARER sh4red'])));
+		$this->assertFalse($signature->verify($this->request(['Authorization' => 'Bearer SH4RED'])));
+		$this->assertFalse($signature->verify($this->request(['Authorization' => 'Basic sh4red'])));
+		$this->assertFalse($signature->verify($this->request(['Authorization' => 'bear'])));
 	}
 }

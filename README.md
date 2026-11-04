@@ -79,11 +79,17 @@ The endpoint refuses a delivery before any handler sees it when the method is no
 (405), the body is over `MaxBodySize` (413), the signature does not verify (401), or the
 body is not JSON and `RequireJson` is on (400). The checks run in that order, so an
 unauthenticated caller cannot make the endpoint hash a large body, and nothing reads the
-payload before the signature has been checked — the body is not even decoded until then,
-and a request whose `Content-Length` already exceeds `MaxBodySize` is refused before it is
-read. A refused delivery reaches the service's `onRefused` event, never `onWebhook`, with
+payload before the signature has been checked — the body is not even decoded until then.
+A disallowed method, or a `Content-Length` over `MaxBodySize`, is refused before the body
+is read at all, and a body without a declared length is read only to `MaxBodySize` plus one
+byte. A refused delivery reaches the service's `onRefused` event, never `onWebhook`, with
 its payload undecoded; a handler there may count or rate limit, and may swap the status for
 another refusal but not for a success.
+
+A signature proves who sent a delivery, not that it is the first copy: an exact replay
+inside `Tolerance` verifies again, and so does a replay of a scheme with no timestamp at any
+age. Providers retry, too. A handler whose work must happen once deduplicates on the
+provider's delivery id.
 
 An endpoint with no `<signature>` child accepts everything, which is only right behind
 something that already authenticates the request. A misspelled child element is refused at
@@ -98,7 +104,7 @@ secret of their own:
 
 ```xml
 <modules>
-	<module id="belisoful/prado-webhooks" Timeout="5" MaxAttempts="3">
+	<module id="belisoful/prado-webhooks" Timeout="5" MaxAttempts="3" MaxRetryDelay="10000">
 		<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature"
 			Secret="..." TimestampHeader="X-Webhook-Timestamp"
 			PayloadFormat="{timestamp}.{body}" />
@@ -124,15 +130,20 @@ foreach ($deliveries as $delivery) {
 ```
 
 A target may be a `TWebhookTarget`, a URL string, or an array of its properties, in which
-`secret` is shorthand for an HMAC signature keyed with it. Targets that are disabled, or
-that subscribe to other events, are skipped.
+`secret` is shorthand for an HMAC signature keyed with it. That signature has the
+`THmacWebhookSignature` defaults — hex in `X-Webhook-Signature`, over `{body}`, with no
+timestamp — not the module's `<signature>` settings; a target that should be signed the
+module's way leaves `secret` out, or sets a `signature` of its own. Targets that are
+disabled, or that subscribe to other events, are skipped.
 
 **Retries.** A 2xx is delivered and a 4xx is refused — the receiver understood the request
-and will not like it better next time. Transport failures and the statuses in
+and will not like it better next time. Redirects are never followed, since following one
+would post the signed body somewhere the subscriber did not name, so a 3xx is a failure that
+is not retried. Transport failures and the statuses in
 `RetryStatusCodes` (500, 502, 503, 504, plus 408, 425 and 429) are retried, with the delay doubling
-from `RetryDelay` up to `MaxRetryDelay`, and a `Retry-After` — seconds or an HTTP date —
-overriding it, capped the same way. A queued delivery honors `Retry-After` too, capped at
-`QueueMaxRetryDelay`.
+from `RetryDelay` up to `MaxRetryDelay`, both in milliseconds, and a `Retry-After` — seconds
+or an HTTP date — overriding it, capped the same way. A queued delivery honors `Retry-After`
+too, capped at `QueueMaxRetryDelay`; the `Queue*` delays are in seconds.
 
 **Deliveries are sent inside the request that triggered them**, so keep `Timeout` ×
 `MaxAttempts` to something a page can afford. `onSending`, `onDelivered` and `onFailed` are
@@ -179,6 +190,10 @@ $webhooks->queue($subscriberRows, ['invoice' => $invoice->toArray()], 'invoice.p
 
 Both calls stay available — `queue()` is a different call, not a mode the module is in.
 
+A `queue()` inside an application transaction on the queue's own connection commits or
+rolls back with that transaction, so a delivery about a change that never happened is never
+queued.
+
 The queue works on SQLite, MySQL and PostgreSQL; all three are exercised by CI.
 
 **The guarantee is at-least-once.** A drain takes a lease on each delivery rather than a lock,
@@ -222,7 +237,12 @@ quietly queueing a delivery that would go out unsigned.
 Sizing: one run sends up to `BatchSize` deliveries and holds them for `LeaseSeconds`. The
 worst case of a run is the sum of the batch's timeouts — each target's own `Timeout` where
 it sets one, the sender's otherwise — so keep that inside the cron interval, or accept
-overlapping runs, which is safe only while the lease outlasts a whole batch. Handlers that
+overlapping runs, which is safe only while the lease outlasts a whole batch. A cron
+`TaskTimeout` stops a run between deliveries and returns what it did not attempt at once.
+A runner that dies mid-attempt has that attempt counted when the delivery is claimed again,
+so a delivery that takes its runner down each time still runs out of attempts. Each request
+blocks the process for its duration; a sender whose `HttpClient` is a
+`TCurlMultiHttpClient` yields to the other cron tasks instead. Handlers that
 throw during a run are recorded on the delivery rather than turning an accepted delivery
 into a retry. `TWebhookPruneCronTask` takes a `BatchSize` too, to bound one prune. Target
 URLs are the application's; `TWebhookTarget::setUrlValidator()` is where it refuses
@@ -245,10 +265,12 @@ The schemes are general and configured, not one class per provider.
 | `TSnsWebhookVerifier` | Amazon SNS, whose signed string is a canonicalization of the body's own fields |
 | `TAnyWebhookSignature` / `TAllWebhookSignature` | several of the above, for a secret rotation or a layered check |
 
-Everything above implements **both** `IWebhookVerifier` and `IWebhookSigner` except the last
-three: an address is not something a sender can put in a header, and SNS carries its
-signature in the body. For the rest, what one PRADO application signs, another verifies with
-an identically configured object.
+Everything above verifies, and everything but `TIpWebhookVerifier` and
+`TSnsWebhookVerifier` signs: an address is not something a sender can put in a header, and
+SNS carries its signature in the body. `TSnsWebhookVerifier` is a `TPublicKeyWebhookSignature`
+whose `sign()` refuses, and the module refuses it as its `<signature>` at boot. The
+composites sign with their children that can. For the rest, what one PRADO application
+signs, another verifies with an identically configured object.
 
 ### What gets signed
 
@@ -278,7 +300,7 @@ Which turns the schemes in the wild into configuration:
 
 ```
 {body}                             a keyed hash of the body alone — the common case
-{timestamp}.{body}                 a timestamped hash, and this package's own default
+{timestamp}.{body}                 a timestamped hash, TFieldedWebhookSignature's default
 {id}.{timestamp}.{body}            the Standard Webhooks layout
 {url}{body}                        the URL and the body
 {url}{params}                      the URL and the sorted form parameters

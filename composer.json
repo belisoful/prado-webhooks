@@ -42,6 +42,8 @@
 	],
 	"require": {
 		"php": ">=8.2.0",
+		"ext-mbstring": "*",
+		"ext-openssl": "*",
 		"composer-runtime-api": "^2.0",
 		"pradosoft/prado": "^4.4@dev"
 	},
@@ -50,6 +52,11 @@
 		"phpdocumentor/shim": "^3",
 		"friendsofphp/php-cs-fixer": "^3.94",
 		"phpstan/phpstan": "^2.1.22"
+	},
+	"suggest": {
+		"ext-curl": "The default transport for sending deliveries and fetching certificates; PHP streams are used without it",
+		"ext-pdo": "Required by TDbWebhookQueue, the database queue for deferred deliveries",
+		"ext-sodium": "Enables the ed25519 algorithm of THttpMessageWebhookSignature"
 	},
 	"minimum-stability": "dev",
 	"prefer-stable": true,

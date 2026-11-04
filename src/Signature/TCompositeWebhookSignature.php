@@ -56,7 +56,7 @@ abstract class TCompositeWebhookSignature extends TApplicationComponent implemen
 	public function init($config): void
 	{
 		foreach ($this->childConfigurationList($config, 'signature') as $child) {
-			$this->addSignature($this->createConfigured($child, [IWebhookVerifier::class, IWebhookSigner::class]));
+			$this->addSignature($this->createConfigured($child, [IWebhookVerifier::class, IWebhookSigner::class], null, true));
 		}
 	}
 
@@ -121,6 +121,17 @@ abstract class TCompositeWebhookSignature extends TApplicationComponent implemen
 	}
 
 	/**
+	 * @return array<\Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner> the children
+	 *   {@see sign} signs with: the first that can sign for a {@see TAnyWebhookSignature}, every
+	 *   one that can for a {@see TAllWebhookSignature}.
+	 * @since 0.2.0
+	 */
+	public function getSigningSignatures(): array
+	{
+		return $this->signingChildren();
+	}
+
+	/**
 	 * Adds a scheme, which is how one is registered from PHP rather than configuration.
 	 * @param object $signature an {@see IWebhookVerifier}, an {@see IWebhookSigner}, or both.
 	 * @throws \Prado\Exceptions\TConfigurationException when $signature is neither.
@@ -128,7 +139,7 @@ abstract class TCompositeWebhookSignature extends TApplicationComponent implemen
 	public function addSignature(object $signature): void
 	{
 		if (!($signature instanceof IWebhookVerifier) && !($signature instanceof IWebhookSigner)) {
-			throw new TConfigurationException('webhooks_component_invalid', $signature::class, IWebhookVerifier::class);
+			throw new TConfigurationException('webhooks_component_invalid', $signature::class, IWebhookVerifier::class . ' or ' . IWebhookSigner::class);
 		}
 		$this->_signatures[] = $signature;
 	}

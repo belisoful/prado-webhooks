@@ -9,6 +9,7 @@ use Belisoful\Prado\Web\Webhooks\TWebhookService;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidDataValueException;
 use Prado\Xml\TXmlDocument;
+use Belisoful\Prado\Web\Webhooks\Signature\TAnyWebhookSignature;
 
 /**
  * Stands in for THttpResponse, which needs a running application to be useful.
@@ -197,6 +198,8 @@ class TestEnvironmentWebhookService extends TWebhookService
 
 class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private TestWebhookService $_service;
 
 	protected function setUp(): void
@@ -543,12 +546,14 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 	public function testAnEndpointWithoutAnIdIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_id_required');
 		$this->_service->init($this->xml('<service id="webhook"><endpoint /></service>'));
 	}
 
 	public function testAnEndpointClassThatIsNotAnEndpointIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_component_invalid');
 		$this->_service->init($this->xml(
 			'<service id="webhook"><endpoint id="x" class="Prado\TComponent" /></service>'
 		));
@@ -559,12 +564,14 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 		$this->endpoint('github');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_endpoint_duplicate');
 		$this->endpoint('github');
 	}
 
 	public function testAnEndpointNeedsAnIdToBeAdded()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_endpoint_id_required');
 		$this->_service->addEndpoint(new TWebhookEndpoint());
 	}
 
@@ -734,18 +741,21 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 	{
 		// ['github'] is a list where a map was meant; it would build an open endpoint at ?webhook=0.
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_id_required');
 		$this->_service->init(['endpoint' => ['github']]);
 	}
 
 	public function testAPhpEndpointThatIsNotAnArrayIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_invalid');
 		$this->_service->init(['endpoint' => ['github' => null]]);
 	}
 
 	public function testAnEndpointWithAnUnknownChildIsRefusedAtBoot()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_unknown');
 		$this->_service->init($this->xml(
 			'<service id="webhook"><endpoint id="github">'
 			. '<signatrue class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" />'
@@ -763,6 +773,7 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 		$this->assertTrue($this->_service->getEndpoint('github')->getRequireVerifier());
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_verifier_required');
 		$this->_service->init($this->xml(
 			'<service id="webhook"><endpoint id="stripe" RequireVerifier="true" /></service>'
 		));
@@ -771,6 +782,7 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 	public function testASuccessStatusThatIsNotAStatusIsRefusedAtBoot()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_status_invalid');
 		$this->_service->init($this->xml(
 			'<service id="webhook"><endpoint id="github" SuccessStatus="ok" /></service>'
 		));
@@ -786,6 +798,7 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 		$this->_service->requestBody = '{}';
 
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_status_invalid');
 		$this->_service->run();
 	}
 
@@ -961,5 +974,161 @@ class TWebhookServiceTest extends PHPUnit\Framework\TestCase
 
 		$this->assertSame(404, $service->response->statusCode);
 		$this->assertSame([], $seen, 'nor does it fall back to the only endpoint');
+	}
+
+	public function testAMethodTheEndpointRefusesIsAnsweredBeforeTheBodyIsRead()
+	{
+		// Without a Content-Length the body was read in full before the endpoint looked at the
+		// method, so a chunked PUT of any size was buffered on its way to a 405.
+		$this->endpoint('github')->setMaxBodySize(10);
+		$this->_service->serviceParameter = 'github';
+		$this->_service->method = 'PUT';
+		$this->_service->requestBody = str_repeat('x', 100);
+
+		$this->_service->run();
+
+		$this->assertSame(405, $this->_service->response->statusCode);
+		$this->assertSame(0, $this->_service->bodyReads);
+	}
+
+	public function testTheMethodIsCheckedBeforeTheDeclaredSize()
+	{
+		$this->endpoint('github')->setMaxBodySize(10);
+		$this->_service->serviceParameter = 'github';
+		$this->_service->method = 'GET';
+		$this->_service->requestHeaders = ['Content-Length' => '2000000'];
+
+		$this->_service->run();
+
+		$this->assertSame(405, $this->_service->response->statusCode, 'method, then size');
+	}
+
+	public function testABodyIsReadNoFurtherThanTheEndpointCouldAccept()
+	{
+		// One byte past MaxBodySize is enough for the endpoint to answer 413, so nothing more
+		// of a chunked body is buffered.
+		$service = new class () extends TestWebhookService {
+			public array $limits = [];
+
+			protected function readBody(): string
+			{
+				$this->limits[] = Closure::bind(fn (TWebhookService $service) => $service->_bodyReadLimit, null, TWebhookService::class)($this);
+
+				return parent::readBody();
+			}
+		};
+		$endpoint = new TWebhookEndpoint();
+		$endpoint->setID('github');
+		$endpoint->setMaxBodySize(10);
+		$service->addEndpoint($endpoint);
+		$service->serviceParameter = 'github';
+		$service->requestBody = str_repeat('x', 11);
+
+		$service->run();
+
+		$this->assertSame([11], $service->limits);
+		$this->assertSame(413, $service->response->statusCode);
+		$this->assertNull(Closure::bind(fn (TWebhookService $s) => $s->_bodyReadLimit, null, TWebhookService::class)($service), 'and the limit ends with the request');
+	}
+
+	public function testAHostTheFrameworkCannotParseGivesAnEmptyUrlRatherThanAnErrorPage()
+	{
+		// PRADO's PSR-7 URI throws on `Host: example.com:abc`, before any check had run, so
+		// anyone could answer every endpoint with a 500.
+		$service = new TestEnvironmentWebhookService();
+		$service->request = new class () extends TestFrameworkRequest {
+			public function getBaseUrl()
+			{
+				throw new TInvalidDataValueException('uri_format_invalid', 'http://example.com:abc');
+			}
+		};
+		$endpoint = new TWebhookEndpoint();
+		$endpoint->setID('github');
+		$endpoint->setRequireJson(false);
+		$service->addEndpoint($endpoint);
+
+		$this->assertSame('', $service->buildRequest()->getUrl());
+		$service->run();
+		$this->assertLessThan(300, $service->response->statusCode, 'a scheme that does not sign the URL is unaffected');
+	}
+
+	public function testARequestRoutedHereWithoutTheParameterReachesTheDefaultEndpoint()
+	{
+		// An onResolveRequest handler or a URL mapping can pick this service without setting
+		// the parameter; that is a request with no parameter, which DefaultEndpoint is for.
+		$service = new TestEnvironmentWebhookService();
+		foreach (['github', 'stripe'] as $id) {
+			$endpoint = new TWebhookEndpoint();
+			$endpoint->setID($id);
+			$endpoint->setRequireJson(false);
+			$service->addEndpoint($endpoint);
+		}
+		$service->setDefaultEndpoint('stripe');
+		$service->request->serviceParameter = null;
+		$seen = [];
+		$service->getEndpoint('stripe')->onWebhook[] = function () use (&$seen) {
+			$seen[] = true;
+		};
+
+		$service->run();
+
+		$this->assertSame([true], $seen);
+	}
+
+	public function testTwoConfiguredEndpointsCannotShareAnId()
+	{
+		// The later one replaced the earlier, and its missing signature left the id open.
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_child_id_duplicate');
+		$this->_service->init($this->xml(
+			'<service id="webhook">'
+			. '<endpoint id="github"><signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="s" /></endpoint>'
+			. '<endpoint id="github" />'
+			. '</service>'
+		));
+	}
+
+	public function testAPropertyBesideTheClassInAPhpSignatureIsRefused()
+	{
+		// It was ignored: a JWT Audience written there left the audience unchecked.
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_property_misplaced');
+		$this->_service->init(['endpoint' => ['github' => ['signature' => [
+			'class' => THmacWebhookSignature::class,
+			'Secret' => 's3cret',
+		]]]]);
+	}
+
+	public function testAPhpCompositeSignatureMayHoldItsChildren()
+	{
+		$this->_service->init(['endpoint' => ['github' => ['signature' => [
+			'class' => TAnyWebhookSignature::class,
+			'signature' => [['class' => THmacWebhookSignature::class, 'properties' => ['Secret' => 's3cret']]],
+		]]]]);
+
+		$verifier = $this->_service->getEndpoint('github')->getVerifier();
+		$this->assertInstanceOf(TAnyWebhookSignature::class, $verifier);
+		$this->assertCount(1, $verifier->getSignatures(), 'built with its children');
+	}
+
+	public function testAnXmlCompositeSignatureIsBuiltWithItsChildren()
+	{
+		// Nothing called the composite's init(), so a rotation configured as the README shows
+		// had no children and threw on every delivery.
+		$this->_service->init($this->xml(
+			'<service id="webhook"><endpoint id="github">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\TAnyWebhookSignature">'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="new" Header="X-Sig" />'
+			. '<signature class="Belisoful\Prado\Web\Webhooks\Signature\THmacWebhookSignature" Secret="old" Header="X-Sig" />'
+			. '</signature></endpoint></service>'
+		));
+		$this->_service->serviceParameter = 'github';
+		$this->_service->requestBody = '{"a":1}';
+		$this->_service->requestHeaders = ['X-Sig' => hash_hmac('sha256', '{"a":1}', 'old')];
+
+		$this->_service->run();
+
+		$this->assertCount(2, $this->_service->getEndpoint('github')->getVerifier()->getSignatures());
+		$this->assertLessThan(300, $this->_service->response->statusCode, 'the old secret still verifies during the rotation');
 	}
 }

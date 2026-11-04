@@ -6,6 +6,8 @@ use Prado\Exceptions\TConfigurationException;
 
 class TFieldedWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const SECRET = 'whsec_test_secret';
 	private const BODY = '{"id":"evt_1","type":"invoice.paid"}';
 
@@ -175,11 +177,18 @@ class TFieldedWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 	public function testEmptySeparatorsAndFieldsAreRefused()
 	{
-		foreach (['setFieldSeparator', 'setValueSeparator', 'setTimestampField', 'setSignatureField'] as $setter) {
+		$codes = [
+			'setFieldSeparator' => 'webhooks_separator_required',
+			'setValueSeparator' => 'webhooks_separator_required',
+			'setTimestampField' => 'webhooks_field_required',
+			'setSignatureField' => 'webhooks_field_required',
+		];
+		foreach ($codes as $setter => $code) {
 			try {
 				(new TFieldedWebhookSignature())->{$setter}('');
 				$this->fail("{$setter}('') should be refused");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex($code), $e->getMessage());
 				$this->assertNotSame('', $e->getMessage());
 			}
 		}
@@ -191,6 +200,7 @@ class TFieldedWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setHeader('X-Signature');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$signature->verify($this->request(['X-Signature' => $this->header(time())]));
 	}
 
@@ -202,6 +212,7 @@ class TFieldedWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setHeader('X-Signature');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$signature->verify($this->request());
 	}
 
@@ -297,5 +308,17 @@ class TFieldedWebhookSignatureTest extends PHPUnit\Framework\TestCase
 
 		$tampered = str_replace('id=msg_2Kt6rHq', 'id=msg_other', $headers['X-Signature']);
 		$this->assertFalse($signature->verify($this->request(['X-Signature' => $tampered])));
+	}
+
+	public function testSigningIntoTheQueryStringIsRefused()
+	{
+		$signature = new TFieldedWebhookSignature();
+		$signature->setSecret('s3cret');
+		$signature->setSource('query');
+		$signature->setName('sig');
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_sign_source_unsupported');
+		$signature->sign(new TWebhookRequest('POST', '{}', []));
 	}
 }

@@ -14,6 +14,7 @@ require_once(__DIR__ . '/../../vendor/autoload.php');
 
 // Base classes the unit suite extends. PHPUnit loads only files named *Test.php, and in
 // directory order, so a base living among them would not reliably be there first.
+require_once(__DIR__ . '/WebhookErrorCodeAssertions.php');
 require_once(__DIR__ . '/TWebhookQueueDriverTestCase.php');
 
 \Prado\Exceptions\TException::addMessageFile(__DIR__ . '/../../config/errorMessages.txt');

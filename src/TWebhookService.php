@@ -11,6 +11,7 @@
 namespace Belisoful\Prado\Web\Webhooks;
 
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\TPropertyValue;
 use Prado\TService;
 use Prado\Web\THttpHeaderName;
@@ -38,8 +39,10 @@ use Prado\Web\THttpHeaderName;
  *
  * The service id is the URL's first parameter and the endpoint id its value, so the
  * configuration above gives the provider `index.php?webhook=github`. An id that names no
- * endpoint, or names a disabled one, gets a 404 and nothing else: a caller cannot use the
- * service to learn which endpoints exist.
+ * endpoint, or names a disabled one, gets a 404 and nothing else. An endpoint id is not a
+ * secret: a known id answers a wrong method with 405 and an unsigned delivery with 401, so
+ * the ids in use can be told from the ids that are not. The signature is what guards an
+ * endpoint.
  *
  * {@see onWebhook} is raised for every endpoint's accepted deliveries -- and only those; a
  * request the endpoint refused reaches {@see onRefused} instead, with its payload
@@ -73,8 +76,6 @@ use Prado\Web\THttpHeaderName;
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
- * @method void dyWebhook(TWebhookEventParameter $param)
- * @method void dyRefused(TWebhookEventParameter $param)
  */
 class TWebhookService extends TService
 {
@@ -94,6 +95,9 @@ class TWebhookService extends TService
 
 	/** @var null|string the endpoint a request with no service parameter reaches */
 	private ?string $_defaultEndpoint = null;
+
+	/** @var null|int how many bytes {@see readBody} reads at most, while {@see run} handles a request */
+	private ?int $_bodyReadLimit = null;
 
 	/**
 	 * Configures the service and every `endpoint` child of it.
@@ -117,8 +121,17 @@ class TWebhookService extends TService
 	/**
 	 * Receives one delivery and answers it.
 	 *
-	 * A body the request declares to be larger than the endpoint accepts is refused before
-	 * it is read, so an unauthenticated caller cannot make the service buffer it either.
+	 * The checks run cheapest first, and the body is read only once they pass:
+	 *
+	 * | Request | Answer | Body read |
+	 * |---|---|---|
+	 * | a method the endpoint does not accept | 405 | no |
+	 * | a declared `Content-Length` over `MaxBodySize` | 413 | no |
+	 * | a body over `MaxBodySize` with no declared length | 413 | `MaxBodySize` + 1 bytes |
+	 * | anything else | the endpoint's | in full |
+	 *
+	 * So an unauthenticated caller cannot make the service buffer more than the endpoint
+	 * accepts, chunked or not.
 	 *
 	 * @throws \Prado\Exceptions\TConfigurationException when the endpoint's verifier is not
 	 *   configured.
@@ -133,12 +146,21 @@ class TWebhookService extends TService
 			return;
 		}
 
+		$maxBodySize = $endpoint->getMaxBodySize();
 		$declared = $this->getDeclaredBodySize();
-		if ($declared !== null && $endpoint->getMaxBodySize() > 0 && $declared > $endpoint->getMaxBodySize()) {
+		if (!in_array($this->getRequestMethod(), $endpoint->getMethods(), true)) {
+			// The endpoint answers 405 before it looks at the body, so none is read.
+			$param = $endpoint->handle($this->createWebhookRequest(false));
+		} elseif ($declared !== null && $maxBodySize > 0 && $declared > $maxBodySize) {
 			$param = new TWebhookEventParameter($endpoint, $this->createWebhookRequest(false));
 			$param->setStatusCode(413);
 		} else {
-			$param = $endpoint->handle($this->createWebhookRequest());
+			$this->_bodyReadLimit = $maxBodySize > 0 ? $maxBodySize + 1 : null;
+			try {
+				$param = $endpoint->handle($this->createWebhookRequest());
+			} finally {
+				$this->_bodyReadLimit = null;
+			}
 		}
 
 		if ($param->getAccepted()) {
@@ -206,14 +228,31 @@ class TWebhookService extends TService
 	 * Reads `php://input` rather than anything PHP has already parsed, because every
 	 * signature scheme hashes the bytes as sent: `$_POST` has been through urldecoding and
 	 * a JSON body never reaches it at all. Override this in a subclass to feed a synthetic
-	 * body to a test. A `multipart/form-data` request is the one kind PHP consumes before
-	 * anything can read the stream; such a body reads as empty here and is refused.
+	 * body to a test.
+	 *
+	 * During {@see run} at most the endpoint's `MaxBodySize` plus one byte is read: enough for
+	 * the endpoint to see the body is too large and answer 413, without buffering a chunked
+	 * body of any size first.
+	 *
+	 * A `multipart/form-data` request is the one kind PHP consumes before anything can read
+	 * the stream; such a body reads as empty here. A scheme over `{body}` refuses it. A scheme
+	 * over the posted fields, `{param:name}` or `{params}`, verifies it from `$_POST`, which
+	 * PHP's `post_max_size` and the declared `Content-Length` check bound rather than
+	 * `MaxBodySize`.
 	 *
 	 * @return string the raw request body, or an empty string when the stream cannot be read.
 	 */
 	protected function readBody(): string
 	{
-		return (string) file_get_contents('php://input');
+		$stream = @fopen('php://input', 'rb');
+		if ($stream === false) {
+			return '';
+		}
+		try {
+			return (string) stream_get_contents($stream, $this->_bodyReadLimit);
+		} finally {
+			fclose($stream);
+		}
 	}
 
 	/**
@@ -264,13 +303,19 @@ class TWebhookService extends TService
 	 *
 	 * The framework hands the parameter over as it was parsed, so `?webhook[]=x` arrives as
 	 * an array. Casting that would warn, and the warning would be a 500 anyone can cause;
-	 * it reads as null here, which no endpoint matches.
+	 * it reads as null here, which no endpoint matches. A request the framework routed here
+	 * without the parameter -- an `onResolveRequest` handler, a URL mapping that sets none --
+	 * reads as an empty string, which reaches {@see getDefaultEndpoint DefaultEndpoint}.
 	 *
-	 * @return null|string the service parameter, or null when it is not a single value.
+	 * @return null|string the service parameter, an empty string when there is none, or null
+	 *   when it is not a single value.
 	 */
 	protected function getServiceParameter(): ?string
 	{
 		$value = $this->getRequest()->getServiceParameter();
+		if ($value === null) {
+			return '';
+		}
 
 		return is_scalar($value) ? (string) $value : null;
 	}
@@ -315,13 +360,23 @@ class TWebhookService extends TService
 	 * saw, so behind a proxy that terminates TLS or rewrites the host it is not the URL the
 	 * provider signed; override this to build the public one from a header only a trusted
 	 * hop can set.
-	 * @return string the absolute URL of the request.
+	 *
+	 * A `Host` header the framework cannot parse into a URL, such as `example.com:abc`, gives
+	 * an empty URL. A scheme that signs the URL then refuses the delivery, and every other
+	 * scheme is unaffected; the framework's exception would otherwise be a 500 anyone can
+	 * cause.
+	 *
+	 * @return string the absolute URL of the request, or an empty string when the request
+	 *   names no host the framework can parse.
 	 */
 	protected function getRequestUrl(): string
 	{
 		$request = $this->getRequest();
-
-		return $request->getBaseUrl() . $request->getRequestUri();
+		try {
+			return $request->getBaseUrl() . $request->getRequestUri();
+		} catch (TInvalidDataValueException) {
+			return '';
+		}
 	}
 
 	/**

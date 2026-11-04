@@ -10,6 +10,7 @@
 
 namespace Belisoful\Prado\Web\Webhooks;
 
+use Prado\IO\Async\TFiberContext;
 use Prado\TPropertyValue;
 use Prado\Util\Cron\TCronModule;
 use Prado\Util\Cron\TCronTask;
@@ -70,7 +71,9 @@ class TWebhookCronTask extends TCronTask
 	private int $_leaseSeconds = self::DEFAULT_LEASE_SECONDS;
 
 	/**
-	 * Drains a batch of the queue.
+	 * Drains a batch of the queue. The run's
+	 * {@see \Prado\Util\Cron\TCronTask::getCancellationToken() CancellationToken}, from
+	 * the cron module's `TaskTimeout`, stops the drain between deliveries.
 	 * @param \Prado\Util\Cron\TCronModule $cronModule the module running this task.
 	 * @throws \Prado\Exceptions\TConfigurationException when the module id names something
 	 *   that is not the webhook module, or no queue is configured.
@@ -78,7 +81,20 @@ class TWebhookCronTask extends TCronTask
 	 */
 	public function execute($cronModule)
 	{
-		return $this->getWebhookModule()->drain($this->_batchSize, $this->_leaseSeconds);
+		$module = $this->getWebhookModule();
+		$key = TWebhookModule::CANCELLATION_CONTEXT_KEY;
+		$had = TFiberContext::has($key);
+		$previous = TFiberContext::get($key);
+		TFiberContext::set($key, $this->getCancellationToken());
+		try {
+			return $module->drain($this->_batchSize, $this->_leaseSeconds);
+		} finally {
+			if ($had) {
+				TFiberContext::set($key, $previous);
+			} else {
+				TFiberContext::remove($key);
+			}
+		}
 	}
 
 	/**

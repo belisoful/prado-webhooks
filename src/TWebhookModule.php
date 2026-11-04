@@ -11,8 +11,12 @@
 namespace Belisoful\Prado\Web\Webhooks;
 
 use Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner;
+use Belisoful\Prado\Web\Webhooks\Signature\TCompositeWebhookSignature;
+use Belisoful\Prado\Web\Webhooks\Signature\TSnsWebhookVerifier;
 use Composer\InstalledVersions;
 use Prado\Exceptions\TConfigurationException;
+use Prado\IO\Async\TCancellationToken;
+use Prado\IO\Async\TFiberContext;
 use Prado\Exceptions\TInvalidDataValueException;
 use Prado\TPropertyValue;
 use Prado\Web\TMediaType;
@@ -76,7 +80,6 @@ use Throwable;
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
- * @method void dyDequeue(TWebhookQueueItem $item)
  */
 class TWebhookModule extends TPluginModule
 {
@@ -98,6 +101,28 @@ class TWebhookModule extends TPluginModule
 	 * @var string
 	 */
 	public const DEFAULT_MODULE_ID = self::PACKAGE_NAME;
+
+	/**
+	 * The {@see \Prado\IO\Async\TFiberContext} key of the cancellation token a drain in this
+	 * fiber stops at. {@see TWebhookCronTask} sets its run's token there.
+	 * @var string
+	 * @since 0.2.0
+	 */
+	public const CANCELLATION_CONTEXT_KEY = self::PACKAGE_NAME . ':cancellation';
+
+	/**
+	 * The last status of a delivery released unattempted when a drain was cancelled.
+	 * @var string
+	 * @since 0.2.0
+	 */
+	public const STATUS_RELEASED = 'released unattempted: the run was cancelled';
+
+	/**
+	 * The last status of a delivery whose attempts ran out while no runner reported back.
+	 * @var string
+	 * @since 0.2.0
+	 */
+	public const STATUS_UNREPORTED = 'abandoned: its last attempts never reported back';
 
 	/** @var int how many attempts a queued delivery gets before it is abandoned. */
 	public const DEFAULT_QUEUE_MAX_ATTEMPTS = 10;
@@ -130,17 +155,48 @@ class TWebhookModule extends TPluginModule
 	 * Configures the module, including the `signature` child that signs deliveries from
 	 * targets carrying no secret of their own.
 	 * @param mixed $config the module configuration.
-	 * @throws \Prado\Exceptions\TConfigurationException when the signature names no class, or
-	 *   names one that cannot sign.
+	 * @throws \Prado\Exceptions\TConfigurationException when the signature names no class,
+	 *   names one that cannot sign, or holds a PHP key it does not read.
 	 */
 	public function init($config): void
 	{
 		if (($signature = $this->childConfiguration($config, 'signature')) !== null) {
 			/** @var \Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner $signer */
-			$signer = $this->createConfigured($signature, IWebhookSigner::class);
+			$signer = $this->createConfigured($signature, IWebhookSigner::class, null, true);
+			$this->assertCanSign($signer);
 			$this->setSignature($signer);
 		}
 		parent::init($config);
+	}
+
+	/**
+	 * Checks at boot that a configured signer can sign, so a verify-only scheme fails when
+	 * the application starts rather than on its first delivery.
+	 *
+	 * | Signer | Result |
+	 * |---|---|
+	 * | {@see \Belisoful\Prado\Web\Webhooks\Signature\TSnsWebhookVerifier} | refused: SNS signs in the body |
+	 * | a composite | each child it signs with is checked; none is refused |
+	 * | any other | accepted |
+	 *
+	 * @param \Belisoful\Prado\Web\Webhooks\Signature\IWebhookSigner $signer the signer.
+	 * @throws \Prado\Exceptions\TConfigurationException when the signer cannot sign.
+	 * @since 0.2.0
+	 */
+	protected function assertCanSign(IWebhookSigner $signer): void
+	{
+		if ($signer instanceof TSnsWebhookVerifier) {
+			throw new TConfigurationException('webhooks_verify_only', $signer::class);
+		}
+		if ($signer instanceof TCompositeWebhookSignature) {
+			$children = $signer->getSigningSignatures();
+			if ($children === []) {
+				throw new TConfigurationException('webhooks_signers_required', $signer::class);
+			}
+			foreach ($children as $child) {
+				$this->assertCanSign($child);
+			}
+		}
 	}
 
 	/**
@@ -280,7 +336,7 @@ class TWebhookModule extends TPluginModule
 			&& !is_object($payload)
 			&& str_starts_with(strtolower($target->getContentType()), TMediaType::FORM)
 		) {
-			throw new TInvalidDataValueException('webhooks_payload_invalid', get_debug_type($payload));
+			throw new TInvalidDataValueException('webhooks_payload_form_invalid', get_debug_type($payload));
 		}
 	}
 
@@ -353,10 +409,21 @@ class TWebhookModule extends TPluginModule
 	 *
 	 * What a handler does after the request is another matter. An `onDelivered` or `onFailed`
 	 * handler that throws has thrown after the receiver answered, so the answer stands: the
-	 * sender is asked to contain those for the length of the run, and the delivery is
-	 * recorded as it went, with the handler's exception on its
+	 * sender contains those for this run, in this fiber
+	 * ({@see TWebhookSender::containingHandlerErrors}), and the delivery is recorded as it
+	 * went, with the handler's exception on its
 	 * {@see TWebhookDelivery::getHandlerError HandlerError} and in the row's last status.
 	 * Treated as a failed attempt instead, an accepted delivery would be sent again.
+	 *
+	 * A delivery that already has every attempt it gets when it is claimed is abandoned
+	 * without another. A queue may count an attempt that never reported back -- the runner
+	 * ran out of memory on a receiver's endless response, or was killed -- and a delivery that
+	 * takes its runner down each time must still run out of attempts.
+	 *
+	 * A drain stops between deliveries once the cancellation token under
+	 * {@see CANCELLATION_CONTEXT_KEY} in the fiber's context is cancelled, which is how a cron
+	 * `TaskTimeout` bounds it. What it claimed and did not attempt goes back at once with its
+	 * attempts unchanged, rather than waiting out the lease.
 	 *
 	 * @param int $limit how many deliveries to take.
 	 * @param int $leaseSeconds how long to hold them for.
@@ -368,12 +435,24 @@ class TWebhookModule extends TPluginModule
 	{
 		$queue = $this->getQueue();
 		$sender = $this->getSender();
+		$token = TFiberContext::get(self::CANCELLATION_CONTEXT_KEY);
+		$token = $token instanceof TCancellationToken ? $token : null;
 
-		$deliveries = [];
-		$contained = $sender->getContainHandlerErrors();
-		$sender->setContainHandlerErrors(true);
-		try {
-			foreach ($queue->claim($limit, $leaseSeconds) as $item) {
+		return $sender->containingHandlerErrors(function () use ($queue, $sender, $token, $limit, $leaseSeconds): array {
+			$deliveries = [];
+			$items = $queue->claim($limit, $leaseSeconds);
+			foreach ($items as $index => $item) {
+				if ($token !== null && $token->isCancelled()) {
+					$this->releaseUnattempted($queue, array_slice($items, $index));
+
+					break;
+				}
+				if ($item->getAttempts() >= ($item->getMaxAttempts() ?: $this->_queueMaxAttempts)) {
+					$item->setLastStatus(self::STATUS_UNREPORTED);
+					$queue->abandon($item);
+
+					continue;
+				}
 				try {
 					$delivery = $this->attempt($sender, $item);
 				} catch (Throwable $e) {
@@ -401,11 +480,24 @@ class TWebhookModule extends TPluginModule
 					$this->failAttempt($queue, $item);
 				}
 			}
-		} finally {
-			$sender->setContainHandlerErrors($contained);
-		}
 
-		return $deliveries;
+			return $deliveries;
+		});
+	}
+
+	/**
+	 * Returns claimed deliveries a cancelled drain did not attempt, due at once and with
+	 * their attempts unchanged.
+	 * @param \Belisoful\Prado\Web\Webhooks\IWebhookQueue $queue the queue they came from.
+	 * @param \Belisoful\Prado\Web\Webhooks\TWebhookQueueItem[] $items the deliveries.
+	 * @since 0.2.0
+	 */
+	protected function releaseUnattempted(IWebhookQueue $queue, array $items): void
+	{
+		foreach ($items as $item) {
+			$item->setLastStatus(self::STATUS_RELEASED);
+			$queue->reschedule($item, 0);
+		}
 	}
 
 	/**
@@ -736,6 +828,45 @@ class TWebhookModule extends TPluginModule
 	public function setRetryDelay($value): void
 	{
 		$this->getSender()->setRetryDelay($value);
+	}
+
+	/**
+	 * @return int the longest wait between attempts inside one send, in milliseconds.
+	 * @since 0.2.0
+	 */
+	public function getMaxRetryDelay(): int
+	{
+		return $this->getSender()->getMaxRetryDelay();
+	}
+
+	/**
+	 * @param mixed $value the ceiling on the wait between attempts inside one send, and on
+	 *   what a `Retry-After` is honored for there, in milliseconds; at least 1.
+	 * @since 0.2.0
+	 */
+	public function setMaxRetryDelay($value): void
+	{
+		$this->getSender()->setMaxRetryDelay($value);
+	}
+
+	/**
+	 * @return bool whether a delivery event handler that throws is recorded on the delivery
+	 *   rather than propagated, for every send.
+	 * @since 0.2.0
+	 */
+	public function getContainHandlerErrors(): bool
+	{
+		return $this->getSender()->getContainHandlerErrors();
+	}
+
+	/**
+	 * @param mixed $value whether a delivery event handler that throws is recorded on the
+	 *   delivery rather than propagated, for every send. A drain contains them regardless.
+	 * @since 0.2.0
+	 */
+	public function setContainHandlerErrors($value): void
+	{
+		$this->getSender()->setContainHandlerErrors($value);
 	}
 
 	/**

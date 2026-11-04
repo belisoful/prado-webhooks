@@ -81,6 +81,8 @@ class TestWebhookCache implements ICache
 
 class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const BODY = '{"event_type":"PAYMENT.CAPTURE.COMPLETED"}';
 
 	private static string $privateKey;
@@ -374,6 +376,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 				$signature->verify($this->request(['X-Signature' => 'abc']));
 				$this->fail('a key that will not parse should be refused');
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_pss_key_invalid'), $e->getMessage());
 				$this->assertNotSame('', $e->getMessage());
 			}
 		}
@@ -404,6 +407,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPrivateKey("-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----");
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$signature->sign($this->request());
 	}
 
@@ -423,6 +427,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPrivateKey((string) $private);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_signing_failed');
 		$signature->sign($this->request());
 	}
 
@@ -443,6 +448,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPublicKey(openssl_pkey_get_details($key)['key']);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_pss_key_invalid');
 		$this->expectExceptionMessage('PSS');
 		$signature->verify($this->request(['X-Signature' => 'abc']));
 	}
@@ -506,6 +512,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setCertificateUrlPattern('');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_certificate_pattern_required');
 		$signature->verify($this->request(['X-Cert-Url' => 'https://certs.example.com/key.pem']));
 	}
 
@@ -612,6 +619,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPublicKey('-----BEGIN PUBLIC KEY----- nonsense -----END PUBLIC KEY-----');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$signature->verify($this->request());
 	}
 
@@ -621,6 +629,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setHeader('X-Signature');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$signature->verify($this->request());
 	}
 
@@ -730,10 +739,12 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 			$signature->getSaltLength();
 			$this->fail('the salt length should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_pss_digest_unsupported'), $e->getMessage());
 			$this->assertStringContainsString('PSS', $e->getMessage());
 		}
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_pss_digest_unsupported');
 		$signature->verify($this->request(['X-Signature' => 'abc']));
 	}
 
@@ -750,6 +761,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 			$signer->sign($this->request());
 			$this->fail('signing should be refused');
 		} catch (TConfigurationException $e) {
+			$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_pss_digest_unsupported'), $e->getMessage());
 			$this->assertStringContainsString('sha1', $e->getMessage());
 		}
 
@@ -757,6 +769,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$verifier->setPadding('pss');
 		$verifier->setAlgorithm('sha1');
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_pss_digest_unsupported');
 		$verifier->verify($this->request(['X-Signature' => 'abc']));
 	}
 
@@ -845,12 +858,14 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testAnUnusablePatternIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_pattern_invalid');
 		(new TPublicKeyWebhookSignature())->setCertificateUrlPattern('#unterminated');
 	}
 
 	public function testAnUnknownDigestIsRefused()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_algorithm_invalid');
 		(new TPublicKeyWebhookSignature())->setAlgorithm('rot13');
 	}
 
@@ -860,12 +875,14 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setHeader('X-Signature');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$signature->verify($this->request(['X-Signature' => 'abc']));
 	}
 
 	public function testSigningWithoutAPrivateKeyIsAConfigurationError()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_private_key_required');
 		$this->verifier()->sign($this->request());
 	}
 
@@ -876,6 +893,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPublicKey('-----BEGIN PUBLIC KEY----- nonsense -----END PUBLIC KEY-----');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$signature->verify($this->request(['X-Signature' => 'abc']));
 	}
 
@@ -889,6 +907,7 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$verifier->setBodyHashName('X-Body-Sha256');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$verifier->verify($this->request(['X-Signature' => 'abc']));
 	}
 
@@ -899,6 +918,38 @@ class TPublicKeyWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$verifier->setTimestampName('X-Timestamp');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$verifier->verify($this->request(['X-Signature' => 'abc']));
+	}
+
+	public function testADeliveryIdThePayloadCoversIsSignedAndSent()
+	{
+		// sign() bound an empty {id} while verify() bound the request's own, so a scheme over
+		// {id} never verified a delivery this package sent.
+		$signer = $this->signer();
+		$signer->setIdHeader('X-Webhook-Id');
+		$signer->setPayloadFormat('{id}.{body}');
+		$headers = $signer->sign($this->request(['X-Webhook-Id' => 'dlv-42']));
+
+		$this->assertSame('dlv-42', $headers['X-Webhook-Id'], 'the id the sender chose');
+		$verifier = $this->verifier();
+		$verifier->setIdHeader('X-Webhook-Id');
+		$verifier->setPayloadFormat('{id}.{body}');
+		$this->assertTrue($verifier->verify($this->request($headers)));
+		$headers['X-Webhook-Id'] = 'dlv-43';
+		$this->assertFalse($verifier->verify($this->request($headers)), 'and the id is bound');
+
+		$minted = $signer->sign($this->request());
+		$this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $minted['X-Webhook-Id'], 'a request without one gets one');
+	}
+
+	public function testSigningIntoTheQueryStringIsRefused()
+	{
+		$signer = $this->signer();
+		$signer->setSource('query');
+
+		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_sign_source_unsupported');
+		$signer->sign($this->request());
 	}
 }

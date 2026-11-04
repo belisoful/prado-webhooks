@@ -75,7 +75,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php-versions }}
-          extensions: ctype, dom, intl, json, mbstring, pcre, pdo, pdo_mysql, pdo_pgsql, pdo_sqlite, sqlite3, spl, zlib
+          extensions: ctype, curl, dom, intl, json, mbstring, openssl, pcre, pdo, pdo_mysql, pdo_pgsql, pdo_sqlite, sodium, sqlite3, spl, zlib
           tools: cs2pr
           # Xdebug costs a lot of run time, so only the leg that measures coverage gets it.
           coverage: ${{ matrix.php-versions == '8.3' && matrix.dependencies == 'highest' && 'xdebug' || 'none' }}
@@ -163,7 +163,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
-          extensions: ctype, dom, intl, json, mbstring, pcre, pdo, pdo_sqlite, sqlite3, spl, zlib
+          extensions: ctype, curl, dom, intl, json, mbstring, openssl, pcre, pdo, pdo_sqlite, sodium, sqlite3, spl, zlib
 
       # Builds a throwaway consumer project that requires the extension through Composer, then
       # asserts that extra.prado's error-messages, class-map, and bootstrap all take effect.

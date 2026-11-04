@@ -6,6 +6,8 @@ use Prado\Exceptions\TConfigurationException;
 
 class TIpWebhookVerifierTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private function request(?string $remote, array $headers = []): TWebhookRequest
 	{
 		return new TWebhookRequest('POST', '{}', $headers, '', [], $remote);
@@ -124,6 +126,7 @@ class TIpWebhookVerifierTest extends PHPUnit\Framework\TestCase
 		$verifier->setForwardedHeader('X-Forwarded-For');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_trusted_proxies_required');
 		$verifier->verify($this->request('10.0.0.1', ['X-Forwarded-For' => '192.0.2.1']));
 	}
 
@@ -147,6 +150,7 @@ class TIpWebhookVerifierTest extends PHPUnit\Framework\TestCase
 	public function testAnEmptyAllowListIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_addresses_required');
 		(new TIpWebhookVerifier())->setAddresses(' , ');
 	}
 
@@ -159,6 +163,7 @@ class TIpWebhookVerifierTest extends PHPUnit\Framework\TestCase
 				(new TIpWebhookVerifier())->setAddresses($range);
 				$this->fail("'{$range}' should be refused");
 			} catch (TConfigurationException $e) {
+				$this->assertMatchesRegularExpression(self::errorMessageRegex('webhooks_prefix_invalid'), $e->getMessage());
 				$this->assertStringContainsString('prefix', strtolower($e->getMessage()));
 			}
 		}
@@ -195,12 +200,14 @@ class TIpWebhookVerifierTest extends PHPUnit\Framework\TestCase
 	public function testAnUnparseableRangeIsRefusedRatherThanSilentlyMatchingNothing()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_address_invalid');
 		(new TIpWebhookVerifier())->setAddresses('192.0.2.0/24, not-an-address');
 	}
 
 	public function testVerifyingWithNoAddressesConfiguredIsAConfigurationError()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_addresses_required');
 		(new TIpWebhookVerifier())->verify($this->request('192.0.2.1'));
 	}
 

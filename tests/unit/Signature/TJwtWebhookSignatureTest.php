@@ -7,6 +7,8 @@ use Prado\Exceptions\TConfigurationException;
 
 class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	private const SECRET = 'a shared signing secret';
 	private const BODY = '{"id":"evt_1"}';
 
@@ -108,12 +110,14 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 	public function testAnAlgorithmThisPackageDoesNotImplementIsRefusedAtConfiguration()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithm_unsupported');
 		(new TJwtWebhookSignature())->setAlgorithms('none');
 	}
 
 	public function testAnEmptyAlgorithmListIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithms_required');
 		(new TJwtWebhookSignature())->setAlgorithms(' , ');
 	}
 
@@ -401,6 +405,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$signature->verify($this->request(['Authorization' => 'Bearer ' . $token]));
 	}
 
@@ -412,6 +417,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 			. '.' . TWebhookEncoding::Base64Url->encode('{}');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$signature->verify($this->request([
 			'Authorization' => 'Bearer ' . $signing . '.' . TWebhookEncoding::Base64Url->encode('sig'),
 		]));
@@ -423,6 +429,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setAlgorithms('RS256');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_private_key_required');
 		$signature->sign($this->request());
 	}
 
@@ -435,6 +442,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 			. '.' . TWebhookEncoding::Base64Url->encode('{}');
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$signature->verify($this->request([
 			'Authorization' => 'Bearer ' . $signing . '.' . TWebhookEncoding::Base64Url->encode('sig'),
 		]));
@@ -447,6 +455,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPrivateKey("-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----");
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_key_invalid');
 		$signature->sign($this->request());
 	}
 
@@ -457,6 +466,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature->setPrivateKey(self::$rsa['private']);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_signing_failed');
 		$signature->sign($this->request());
 	}
 
@@ -465,12 +475,14 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$signature = new TJwtWebhookSignature();
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$signature->sign($this->request());
 	}
 
 	public function testAnUnknownBodyHashAlgorithmIsRefused()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_algorithm_invalid');
 		(new TJwtWebhookSignature())->setBodyHashAlgorithm('rot13');
 	}
 
@@ -657,6 +669,7 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		$verifier->verify($this->request(['Authorization' => 'Bearer ' . $token]));
 	}
 
@@ -667,12 +680,14 @@ class TJwtWebhookSignatureTest extends PHPUnit\Framework\TestCase
 		$token = $this->token(['alg' => 'HS256'], ['exp' => time() + 300]);
 
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_public_key_required');
 		$verifier->verify($this->request(['Authorization' => 'Bearer ' . $token]));
 	}
 
 	public function testVerifyingWithoutAnyKeyIsAConfigurationErrorEvenWhenNoTokenIsPresented()
 	{
 		$this->expectException(TConfigurationException::class);
+		$this->expectErrorCode('webhooks_secret_required');
 		(new TJwtWebhookSignature())->verify($this->request());
 	}
 }

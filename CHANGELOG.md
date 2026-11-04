@@ -13,10 +13,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CI matrix follow; a package pinned to 8.1 could no longer install the framework at all.
 - `TWebhookSender` waits out a retry backoff through PRADO's `TAsync::sleep()` rather than
   `usleep`. From the main fiber the wait runs the event loop until it is over, as before
-  from the caller's point of view; from a worker fiber -- a cron task drained alongside
-  others, a `send()` started with `TAsync::run()` -- it yields, so a backoff holds that one
-  delivery rather than the whole process. `pause()` keeps its signature, so a subclass that
+  from the caller's point of view; from a worker fiber -- a `send()` started with
+  `TAsync::run()`, or from a cron task -- it yields, so a backoff holds that one delivery
+  rather than the whole process. `pause()` keeps its signature, so a subclass that
   overrides it to skip the wait still does.
+- `ext-openssl` and `ext-mbstring` are required; both were already used unguarded. `ext-pdo`,
+  `ext-curl` and `ext-sodium` are suggested.
+- The SNS certificate URL pattern accepts only Amazon's own
+  `SimpleNotificationService-<hex>.pem` file, not any `.pem` path on an SNS host.
+- A delivery whose runner never reported back -- killed, or out of memory on a receiver's
+  endless response -- has that attempt counted when it is claimed again, and is abandoned
+  once its attempts run out, with `TWebhookModule::STATUS_UNREPORTED` as its last status.
+- The service checks the method before reading the body, and reads a body without a
+  declared length only to `MaxBodySize` plus one byte.
+- A request with no service parameter reaches `DefaultEndpoint`, as the property describes.
+- `TTokenWebhookSignature` matches its `Prefix`, the authentication scheme, case-insensitively.
+- `@query-param` values are canonicalized as RFC 9421 section 2.2.8 says: `+` is a space,
+  re-encoded `%20`, and `~` is encoded while `*` is not.
+- Error messages that did not fit the condition raising them are reworded or given codes of
+  their own: `webhooks_verify_only` for SNS signing, `webhooks_payload_form_invalid` for a
+  form payload that is not an array, `webhooks_child_not_array` for a single child, and
+  `webhooks_algorithm_invalid` for a body hash algorithm or ed25519 this PHP lacks.
+- The `@method dy*` tags are removed: no dynamic event was ever raised under those names.
+
+### Added
+
+- `TWebhookSender::containingHandlerErrors()`, which contains handler errors for one fiber.
+  A drain uses it instead of setting the sender-wide `ContainHandlerErrors`.
+- A drain stops between deliveries when a cron `TaskTimeout` cancels its run, and returns
+  what it did not attempt at once; `TWebhookModule::CANCELLATION_CONTEXT_KEY` names where
+  the token is found.
+- `MaxRetryDelay` and `ContainHandlerErrors` on `TWebhookModule`, passed to its sender.
+- `TCompositeWebhookSignature::getSigningSignatures()`.
 
 ### Fixed
 
@@ -26,6 +54,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apostrophes are doubled, `''{0}''`, which ICU renders as the value in single quotes. The
   package standard checks now render every message with every argument and fail on one that
   goes missing.
+- A `TAnyWebhookSignature` or `TAllWebhookSignature` configured as an endpoint's or the
+  module's `<signature>`, in XML or PHP, was built without its children and threw on every
+  delivery; it is built with them.
+- Two drains in one process, or a drain and an inline send, could switch the sender's
+  `ContainHandlerErrors` under each other, so a handler error after a 2xx sent an accepted
+  delivery again.
+- A `TCachedHttpClient` substituted as the sender's client kept the timeout and the
+  no-redirects setting to itself, so a 307 re-posted the signed body to the host it named.
+  The settings now reach the client it wraps, and are applied per attempt, so an
+  interleaved delivery cannot change another's timeout.
+- A `Retry-After` HTTP-date far in the future, such as `@99999999999999999`, made
+  `parseRetryAfter()` throw a `TypeError`; it saturates as the seconds form does.
+- A queued payload holding an empty object or an object keyed `"0"`, `"1"`, ... came back
+  as an array and was sent as `[]` or a list; it is sent as it was queued.
+- `reschedule()` and `abandon()` on an item that carries no lease no longer release the lease
+  of a runner that holds the row, as `remove()` already did.
+- A chunked `prune()` no longer deletes a row set back to pending between its two statements.
+- Two runners creating the queue table at once no longer fail on the second `CREATE INDEX`;
+  a missing table is reported with the database's own error.
+- A `Host` header the framework cannot parse, such as `example.com:abc`, no longer answers
+  every endpoint with a 500.
+- Two XML endpoints with the same id are refused; the later one replaced the earlier, verifier
+  and all.
+- A property written beside `class` in a PHP `signature` array, rather than inside
+  `properties`, is refused; it was ignored, which for a JWT `Audience` or `Issuer` dropped the
+  check.
+- `TPublicKeyWebhookSignature` signs the delivery id when `PayloadFormat` covers `{id}`, and
+  sends it; it signed an empty id, so its own deliveries never verified.
+- A timestamp must be whole seconds in digits. `is_numeric` accepted `1700000000.5`, which
+  under `{timestamp}.{body}` let a replay move bytes between the timestamp and the body.
+- HMAC, fielded and public-key signing refuse a `Source` other than `header`, as the token
+  scheme does, rather than returning a header the receiver never reads.
+- The module refuses `TSnsWebhookVerifier`, or a composite with nothing that can sign, as its
+  `<signature>` at boot rather than on the first send.
 
 ## [0.1.0] - 2026-09-27
 

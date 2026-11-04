@@ -66,7 +66,6 @@ use Prado\Xml\TXmlElement;
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.1.0
- * @method void dyWebhook(TWebhookEventParameter $param)
  */
 class TWebhookEndpoint extends TApplicationComponent
 {
@@ -125,7 +124,7 @@ class TWebhookEndpoint extends TApplicationComponent
 		$this->assertKnownChildren($config);
 		if (($signature = $this->childConfiguration($config, self::SIGNATURE_TAG)) !== null) {
 			/** @var \Belisoful\Prado\Web\Webhooks\Signature\IWebhookVerifier $verifier */
-			$verifier = $this->createConfigured($signature, IWebhookVerifier::class);
+			$verifier = $this->createConfigured($signature, IWebhookVerifier::class, null, true);
 			$this->setVerifier($verifier);
 		}
 		if ($this->_requireVerifier && $this->_verifier === null) {

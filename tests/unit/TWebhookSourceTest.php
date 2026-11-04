@@ -5,6 +5,8 @@ use Prado\Exceptions\TInvalidDataValueException;
 
 class TWebhookSourceTest extends PHPUnit\Framework\TestCase
 {
+	use WebhookErrorCodeAssertions;
+
 	public function testEnsurePassesASourceThrough()
 	{
 		$this->assertSame(TWebhookSource::Query, TWebhookSource::ensure(TWebhookSource::Query));
@@ -19,6 +21,7 @@ class TWebhookSourceTest extends PHPUnit\Framework\TestCase
 	public function testEnsureRejectsAnUnknownName()
 	{
 		$this->expectException(TInvalidDataValueException::class);
+		$this->expectErrorCode('webhooks_source_invalid');
 		TWebhookSource::ensure('cookie');
 	}
 }

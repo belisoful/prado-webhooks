@@ -286,13 +286,37 @@ abstract class TWebhookSignature extends TApplicationComponent
 	}
 
 	/**
+	 * Refuses to sign when the signature lives anywhere but a header.
+	 *
+	 * A signer returns headers. A scheme read from the query string or the posted fields
+	 * would put its signature in a header the receiver never reads, and every delivery
+	 * would be refused while looking signed.
+	 *
+	 * @throws \Prado\Exceptions\TConfigurationException when {@see getSource Source} is not
+	 *   `header`.
+	 * @since 0.2.0
+	 */
+	protected function assertSignsInHeader(): void
+	{
+		if ($this->getHeader() === null) {
+			throw new TConfigurationException('webhooks_sign_source_unsupported', $this->getSource()->value, static::class);
+		}
+	}
+
+	/**
 	 * Whether a presented timestamp falls inside {@see getTolerance Tolerance} of now.
+	 *
+	 * Only whole seconds in plain digits are a timestamp, which is all any signer here
+	 * emits. The bound timestamp is the presented string, so a looser reading would let a
+	 * replay move bytes across the separator: `1700000000.5` with a body starting `00`
+	 * signs the same `{timestamp}.{body}` as `1700000000` with a body starting `5.00`.
+	 *
 	 * @param null|string $timestamp the timestamp, as Unix seconds.
-	 * @return bool whether the timestamp is numeric and recent enough.
+	 * @return bool whether the timestamp is an integer and recent enough.
 	 */
 	protected function isFresh(?string $timestamp): bool
 	{
-		if ($timestamp === null || !is_numeric($timestamp)) {
+		if ($timestamp === null || preg_match('/^-?\d+$/D', $timestamp) !== 1) {
 			return false;
 		}
 		if ($this->_tolerance <= 0) {
@@ -648,7 +672,7 @@ abstract class TWebhookSignature extends TApplicationComponent
 	{
 		$algorithm = strtolower(trim(TPropertyValue::ensureString($value)));
 		if (!in_array($algorithm, hash_algos(), true)) {
-			throw new TConfigurationException('webhooks_algorithm_unsupported', $algorithm, static::class);
+			throw new TConfigurationException('webhooks_algorithm_invalid', $algorithm);
 		}
 		$this->_bodyHashAlgorithm = $algorithm;
 	}
